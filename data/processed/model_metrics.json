@@ -1,0 +1,57 @@
+{
+  "target": "yield_tons",
+  "test_size": 0.2,
+  "n_train": 8,
+  "n_test": 2,
+  "mae": 15.1075,
+  "rmse": 15.11911414402312,
+  "r2": -100.59449444444444,
+  "features_used": [
+    "sex",
+    "age",
+    "community_village",
+    "district_lga",
+    "state_region",
+    "farm_size_ha",
+    "soil_ph",
+    "nitrogen_ppm",
+    "phosphorus_ppm",
+    "potassium_ppm",
+    "organic_matter",
+    "season_e_g_2024_maize",
+    "crop",
+    "area_harvested_ha",
+    "soil_type",
+    "uses_fertilizer",
+    "fertilizer_type",
+    "fertilizer_type_organic",
+    "fertilizer_type_urea",
+    "fertilizer_type_npk",
+    "fertilizer_type_compost",
+    "irrigation_used",
+    "improved_seed_used",
+    "extension_visits_last_12_months",
+    "market_distance_km"
+  ],
+  "n_features": 25,
+  "cv": {
+    "mae": {
+      "mean": 27.68,
+      "std": 13.806147936094753,
+      "ci95": 8.557139145493274,
+      "n_folds": 10
+    },
+    "rmse": {
+      "mean": 31.359579475856997,
+      "std": 17.76939519690492,
+      "ci95": 11.013585247311642,
+      "n_folds": 10
+    },
+    "r2": {
+      "mean": -537.6648682327503,
+      "std": 988.069732190125,
+      "ci95": 612.4119647955035,
+      "n_folds": 10
+    }
+  }
+}

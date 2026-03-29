@@ -1,0 +1,13 @@
+{
+  "raw_data_path": "data/raw/kobo_export_raw.csv",
+  "raw_fallback_path": "data/raw/kobo_export.csv",
+  "clean_data_path": "data/processed/clean_data.csv",
+  "features_data_path": "data/processed/features.csv",
+  "metrics_path": "data/processed/model_metrics.json",
+  "predictions_path": "data/processed/predictions.csv",
+  "model_path": "data/processed/model_pipeline.joblib",
+  "dashboard_hist_bins": 18,
+  "top_regions_limit": 10,
+  "enable_animations": true,
+  "show_data_diff": true
+}
