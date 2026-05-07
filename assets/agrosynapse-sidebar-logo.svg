@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="64"
+   height="64"
+   viewBox="0 0 64 64"
+   fill="none"
+   version="1.1"
+   id="svg6"
+   sodipodi:docname="agrosynapse-sidebar-logo.svg"
+   inkscape:version="1.4.3 (0d15f75, 2025-12-25)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview6"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="8.4079416"
+     inkscape:cx="11.715115"
+     inkscape:cy="27.414558"
+     inkscape:window-width="1920"
+     inkscape:window-height="1000"
+     inkscape:window-x="-11"
+     inkscape:window-y="-11"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="g6" />
+  <defs
+     id="defs2">
+    <linearGradient
+       id="agroGradient"
+       x1="8"
+       y1="8"
+       x2="56"
+       y2="56"
+       gradientUnits="userSpaceOnUse">
+      <stop
+         stop-color="#6EE7A1"
+         id="stop1" />
+      <stop
+         offset="1"
+         stop-color="#1F6B3B"
+         id="stop2" />
+    </linearGradient>
+  </defs>
+  <rect
+     x="0.5"
+     y="0.5"
+     width="63"
+     height="63"
+     rx="17.5"
+     fill="#0E1722"
+     stroke="#7FCF9F"
+     stroke-opacity="0.26"
+     id="rect2" />
+  <g
+     transform="translate(-3 0)"
+     id="g6">
+    <circle
+       cx="24"
+       cy="35"
+       r="5.5"
+       fill="url(#agroGradient)"
+       id="circle2" />
+    <circle
+       cx="46.5"
+       cy="41.5"
+       r="4.5"
+       fill="url(#agroGradient)"
+       id="circle3" />
+    <path
+       d="m 22.990802,34.936925 c 3.4,-6.2 6.9,-10.2 12.2,-12.2"
+       stroke="url(#agroGradient)"
+       stroke-width="3.4"
+       stroke-linecap="round"
+       id="path3"
+       sodipodi:nodetypes="cc" />
+    <path
+       d="M24 35C29.2 36 36.6 38.4 46.5 41.5"
+       stroke="url(#agroGradient)"
+       stroke-width="3.4"
+       stroke-linecap="round"
+       id="path4" />
+    <path
+       d="M 32.8,22.5 C 34.223653,13.001051 45.625624,11.278449 53.673324,16.209198 45.77365,19.244316 44.444522,29.618694 35.7,24.8 34,24.1 33.1,23.3 32.8,22.5 Z"
+       fill="url(#agroGradient)"
+       id="path5"
+       sodipodi:nodetypes="cccc" />
+    <path
+       d="m 54.410055,16.278307 c -10.873701,-0.796554 -19.609021,6.546656 -19.609021,6.546656 0,0 4.136576,-9.863885 19.609021,-6.546656 z"
+       fill="#0e1722"
+       id="path6"
+       sodipodi:nodetypes="ccc" />
+  </g>
+</svg>
