@@ -1,56 +1,64 @@
 {
   "target": "yield_tons",
   "test_size": 0.2,
-  "n_train": 8,
-  "n_test": 2,
-  "mae": 15.1075,
-  "rmse": 15.11911414402312,
-  "r2": -100.59449444444444,
+  "n_train": 40,
+  "n_test": 10,
+  "mae": 11.226750000000026,
+  "rmse": 12.720523351556718,
+  "r2": -0.013336308519879214,
+  "model_type": "extra_trees",
+  "candidate_metrics": {
+    "random_forest": {
+      "mae": 11.231919473784318,
+      "rmse": 12.70718825517699,
+      "r2": -0.011212833868939232
+    },
+    "extra_trees": {
+      "mae": 11.226750000000026,
+      "rmse": 12.720523351556718,
+      "r2": -0.013336308519879214
+    }
+  },
+  "baseline_metrics": {
+    "mae": 11.750999999999998,
+    "rmse": 12.958579590371778,
+    "r2": -0.05161905266001421
+  },
+  "dataset_profile": {
+    "n_rows": 50,
+    "n_columns": 1,
+    "n_numeric_features": 0,
+    "n_categorical_features": 1,
+    "estimated_encoded_features": 5,
+    "high_cardinality_features": [],
+    "warnings": []
+  },
+  "encoder": {
+    "sparse_output": true,
+    "min_frequency": null,
+    "max_categories": null
+  },
   "features_used": [
-    "sex",
-    "age",
-    "community_village",
-    "district_lga",
-    "state_region",
-    "farm_size_ha",
-    "soil_ph",
-    "nitrogen_ppm",
-    "phosphorus_ppm",
-    "potassium_ppm",
-    "organic_matter",
-    "season_e_g_2024_maize",
-    "crop",
-    "area_harvested_ha",
-    "soil_type",
-    "uses_fertilizer",
-    "fertilizer_type",
-    "fertilizer_type_organic",
-    "fertilizer_type_urea",
-    "fertilizer_type_npk",
-    "fertilizer_type_compost",
-    "irrigation_used",
-    "improved_seed_used",
-    "extension_visits_last_12_months",
-    "market_distance_km"
+    "soil_type"
   ],
-  "n_features": 25,
+  "n_features": 1,
   "cv": {
     "mae": {
-      "mean": 27.68,
-      "std": 13.806147936094753,
-      "ci95": 8.557139145493274,
+      "mean": 11.778045864057777,
+      "std": 1.7185994394872166,
+      "ci95": 1.0651989683965912,
       "n_folds": 10
     },
     "rmse": {
-      "mean": 31.359579475856997,
-      "std": 17.76939519690492,
-      "ci95": 11.013585247311642,
+      "mean": 13.554514259178465,
+      "std": 1.695410273202514,
+      "ci95": 1.0508261742265825,
       "n_folds": 10
     },
     "r2": {
-      "mean": -537.6648682327503,
-      "std": 988.069732190125,
-      "ci95": 612.4119647955035,
+      "mean": -0.12974482764299264,
+      "std": 0.20290320328158207,
+      "ci95": 0.12576070831513428,
       "n_folds": 10
     }
   }

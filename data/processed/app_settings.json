@@ -1,6 +1,6 @@
 {
   "raw_data_path": "data/raw/kobo_export_raw.csv",
-  "raw_fallback_path": "data/raw/kobo_export.csv",
+  "raw_fallback_path": "data/raw/kobo_csv",
   "clean_data_path": "data/processed/clean_data.csv",
   "features_data_path": "data/processed/features.csv",
   "metrics_path": "data/processed/model_metrics.json",

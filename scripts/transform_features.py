@@ -14,9 +14,11 @@ import argparse
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from pandas.api.types import is_bool_dtype, is_numeric_dtype
 from sklearn.compose import ColumnTransformer
+from transform_utils import ToNumericTransformer, ToStringTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -31,6 +33,8 @@ except ImportError:  # pragma: no cover
 LOGGER = logging.getLogger(__name__)
 
 
+
+
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -39,14 +43,19 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-def infer_feature_columns(df: pd.DataFrame, target: str | None) -> tuple[list[str], list[str]]:
+def infer_feature_columns(
+    df: pd.DataFrame,
+    target: str | None,
+    numeric_ratio_threshold: float = 0.85,
+) -> tuple[list[str], list[str]]:
     feature_df = df.drop(columns=[target], errors="ignore") if target else df
     categorical_cols: list[str] = []
     numeric_cols: list[str] = []
 
     for column in feature_df.columns:
         series = feature_df[column]
-        if is_numeric_dtype(series) and not is_bool_dtype(series):
+        numeric_ratio = float(pd.to_numeric(series, errors="coerce").notna().mean())
+        if (is_numeric_dtype(series) or numeric_ratio >= numeric_ratio_threshold) and not is_bool_dtype(series):
             numeric_cols.append(column)
         else:
             categorical_cols.append(column)
@@ -68,12 +77,16 @@ def build_preprocessor(
     categorical_pipeline = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("to_string", ToStringTransformer()),
             ("encoder", build_encoder()),
         ]
     )
 
     numeric_pipeline = Pipeline(
-        steps=[("imputer", SimpleImputer(strategy="median"))]
+        steps=[
+            ("to_numeric", ToNumericTransformer()),
+            ("imputer", SimpleImputer(strategy="median")),
+        ]
     )
 
     transformers = []

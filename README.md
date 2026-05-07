@@ -1,17 +1,17 @@
 ﻿# AgroSynapse
 
-> **Yield Intelligence Platform** - Transforming agricultural survey data into predictive insights for smallholder farmers and extension services.
+> **Agricultural Survey Intelligence Platform** - Transforming agricultural survey data into predictive insights for smallholder farmers and extension services.
 
 ---
 
 ## Overview
 
-**AgroSynapse** is a venture-stage data platform that combines mobile-first survey collection (KoboToolbox), ML-powered yield prediction, and interactive analytics to unlock productivity gains for farming communities. We build the bridge between farm-level data and farm-level decisions.
+**AgroSynapse** is a venture-stage data platform that combines mobile-first survey collection (KoboToolbox), ML-powered predictive analytics, and interactive dashboards to unlock productivity gains for farming communities. We transform any agricultural survey data into actionable insights for farm-level decisions.
 
 ### Why AgroSynapse?
 - **350M+ smallholder farmers** lack access to data-driven recommendations
 - **Mobile-first collection** reaches farmers where they are
-- **ML models** trained on soil, weather, and practice data
+- **ML models** trained on soil, weather, and farming practice data
 - **Actionable dashboards** for extension agents and cooperatives
 
 ---
@@ -21,10 +21,9 @@
 ```text
 KoboToolbox (Mobile Collection [Desktop web for training])
   -> Python ETL (Pandas / Scikit-learn)
-  -> PostgreSQL (Data Warehouse)
   -> ML Models (RandomForest, Regression)
   -> Streamlit Dashboard (Analytics UI)
-  -> FastAPI (Inference API - coming soon)
+  -> FastAPI (Inference API)
 ```
 
 ---
@@ -33,7 +32,7 @@ KoboToolbox (Mobile Collection [Desktop web for training])
 
 - **Mobile-first surveys**: KoboToolbox integration and offline support
 - **Automated ETL**: Metadata filtering, imputation, and one-hot encoding
-- **Predictive models**: RandomForest yield prediction with MAE/RMSE/R2 tracking
+- **Predictive models**: Machine learning models for any agricultural outcome prediction
 - **Interactive dashboard**: Streamlit UI for extension agents and cooperatives
 - **Fast inference**: Sub-second predictions on new survey submissions
 - **Data privacy**: On-premise deployment with no cloud lock-in
@@ -56,12 +55,10 @@ agrosynapse/
 |   |-- train_model.py
 |   |-- predict.py
 |   `-- run_pipeline.py
+|-- app_api.py
 |-- notebooks/
 |   |-- 01_eda.ipynb
 |   `-- 02_yield_prediction.ipynb
-|-- sql/
-|   |-- schema.sql
-|   `-- sample_inserts.sql
 |-- docs/
 |   |-- PRD.md
 |   |-- UI_SPEC.md
@@ -127,7 +124,6 @@ python scripts/run_pipeline.py --input data/raw/AgroSynapse_Survey_.csv
 ### Prerequisites
 - Python 3.8+
 - pip / conda
-- (Optional) PostgreSQL 12+
 
 ### Installation
 
@@ -160,9 +156,15 @@ python scripts/run_pipeline.py
 
 # 3. Launch dashboard
 streamlit run streamlit_app.py
+
+# 4) Start inference API
+uvicorn app_api:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Dashboard opens at: `http://localhost:8501`
+API opens at: `http://localhost:8000`
+
+Use the API from a mobile or web client by POSTing survey records to `http://localhost:8000/predict`.
 
 ---
 
@@ -188,10 +190,10 @@ flake8 scripts/
 
 ## Roadmap
 
-- [ ] **v0.2**: FastAPI inference endpoint and mobile app integration
+- [ ] **v0.2**: FastAPI inference endpoint and mobile app integration (scaffolded)
 - [ ] **v0.3**: Multi-language support (Hausa, Swahili, French)
 - [ ] **v0.4**: Advanced analytics (time-series forecasting, anomaly detection)
-- [ ] **v1.0**: Production-grade deployment and Postgres sync
+- [ ] **v1.0**: Production-grade deployment and optional Postgres sync
 
 ---
 
@@ -199,7 +201,7 @@ flake8 scripts/
 
 - **Market**: 45M+ farms in Sub-Saharan Africa alone
 - **Revenue models**: B2B2C licensing, per-prediction API calls, premium analytics
-- **MVP status**: Functional yield prediction model with reproducible metrics in `data/processed/model_metrics.json`
+- **MVP status**: Functional predictive modeling platform with reproducible metrics in `data/processed/model_metrics.json`
 - **Next milestone**: Deploy pilot with 10K+ farmers in 2 countries
 
 For investor deck or partnership inquiries: investors@agrosynapse.io

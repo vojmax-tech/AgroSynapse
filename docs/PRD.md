@@ -3,48 +3,55 @@
 ## AgroSynapse
 
 ### Overview
-AgroSynapse is an intelligent agricultural data pipeline that transforms KoboToolbox survey data into analytics-ready datasets, relational storage, and machine learning features.
+AgroSynapse is an intelligent agricultural survey intelligence platform that transforms any agricultural survey data into predictive insights. It combines mobile-first data collection, automated ETL processing, machine learning models, and interactive dashboards for farm-level decision support.
 
 ### Problem Statement
-Field survey data is often inconsistent, noisy, and difficult to analyze. AgroSynapse standardizes ingestion, cleaning, and modeling to enable reliable insights and decision-making.
+Smallholder farmers lack access to data-driven recommendations. Agricultural survey data is often inconsistent and difficult to analyze. AgroSynapse standardizes processing and provides actionable insights through predictive modeling and visualization.
 
 ### Objectives
-- Ingest KoboToolbox survey exports reliably
-- Apply consistent data cleaning and transformation rules
-- Store normalized data in a relational schema
-- Enable EDA and baseline yield prediction
+- Support any agricultural survey data format (not just KoboToolbox)
+- Apply consistent data cleaning and feature engineering
+- Train predictive models for agricultural outcomes
+- Provide interactive dashboards for extension agents and cooperatives
+- Enable real-time inference via API
 
 ### Target Users
-- Agronomists
-- Data analysts
-- Program managers
-- Research teams
+- Extension agents and agronomists
+- Agricultural cooperatives and NGOs
+- Farm managers and researchers
+- Smallholder farmers (via mobile apps)
 
 ### Functional Requirements
-- CSV ingestion from KoboToolbox exports
+- CSV ingestion with automatic field detection
 - Data cleaning with reproducible rules
 - Feature engineering and categorical encoding
-- SQL schema for farmers, soil tests, and yields
-- Notebooks for EDA and yield modeling
+- Machine learning pipeline for prediction
+- Interactive Streamlit dashboard with charts and filters
+- FastAPI inference endpoint for real-time predictions
+- Support for arbitrary agricultural survey schemas
 
 ### Data Processing Rules
 - Normalize column names (lowercase, underscores)
-- Encode categorical values (one-hot)
-- Drop Kobo metadata fields
+- Encode categorical values (one-hot for modeling)
 - Handle missing data (median for numeric, most frequent for categorical)
+- Automatic field type detection and conversion
+- Drop metadata fields (timestamps, UUIDs, etc.)
 
 ### Non-Functional Requirements
-- Python 3.9+
-- PEP8-compliant, modular code
-- Auditable and reproducible processing
-- Clear documentation
+- Python 3.8+
+- Modular, PEP8-compliant code
+- Fast inference (<1 second per prediction)
+- On-premise deployment with no cloud lock-in
+- Responsive web interface
 
 ### Success Metrics
-- Clean dataset generation without manual intervention
-- Consistent relational inserts into PostgreSQL
-- Baseline yield prediction model with documented metrics
+- Clean dataset generation from any CSV input
+- Predictive model with documented performance metrics
+- User-friendly dashboard with actionable insights
+- API endpoint serving predictions reliably
 
 ### Risks
-- Missing or inconsistent survey fields
-- Low sample size for modeling
-- Data quality variance across regions
+- Variable data quality across different survey formats
+- Low sample sizes for certain crops/regions
+- Complex survey schemas requiring manual mapping
+- Performance with large datasets
