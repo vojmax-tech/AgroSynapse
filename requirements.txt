@@ -1,7 +1,17 @@
-pandas
-numpy
-matplotlib
-seaborn
-scikit-learn
-streamlit
-joblib
+# Core data / ML stack (pinned to the versions in .venv, Python 3.11+)
+pandas==2.3.3
+numpy==2.4.3
+scikit-learn==1.8.0
+joblib==1.5.3
+
+# Visualisation
+matplotlib==3.10.8
+altair==6.0.0
+
+# Dashboard
+streamlit==1.55.0
+
+# Inference API (app_api.py)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7

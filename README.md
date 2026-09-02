@@ -1,4 +1,4 @@
-﻿# AgroSynapse
+# AgroSynapse
 
 > **Agricultural Survey Intelligence Platform** - Transforming agricultural survey data into predictive insights for smallholder farmers and extension services.
 
@@ -44,18 +44,22 @@ KoboToolbox (Mobile Collection [Desktop web for training])
 ```text
 agrosynapse/
 |-- data/
-|   |-- raw/
-|   |   `-- kobo_export.csv
-|   `-- processed/
-|       `-- clean_data.csv
+|   |-- raw/                        # Kobo exports (input)
+|   `-- processed/                  # clean_data.csv, features.csv,
+|                                   # model_pipeline.joblib, model_metrics.json
 |-- scripts/
 |   |-- ingest_kobo.py
 |   |-- clean_data.py
+|   |-- feature_config.py
+|   |-- transform_utils.py
 |   |-- transform_features.py
 |   |-- train_model.py
 |   |-- predict.py
 |   `-- run_pipeline.py
-|-- app_api.py
+|-- streamlit_app.py                # Analytics dashboard
+|-- app_api.py                      # FastAPI inference service
+|-- assets/                         # Logo and dashboard CSS
+|-- .streamlit/config.toml          # Dashboard theme
 |-- notebooks/
 |   |-- 01_eda.ipynb
 |   `-- 02_yield_prediction.ipynb
@@ -64,17 +68,8 @@ agrosynapse/
 |   |-- UI_SPEC.md
 |   `-- DATA_DICTIONARY.md
 |-- requirements.txt
+|-- requirements-dev.txt
 `-- README.md
-```
-
----
-
-## Setup
-
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
 ```
 
 ---
@@ -122,26 +117,31 @@ python scripts/run_pipeline.py --input data/raw/AgroSynapse_Survey_.csv
 ## Quick Start
 
 ### Prerequisites
-- Python 3.8+
-- pip / conda
+- Python 3.11+ (the committed `model_pipeline.joblib` is built with scikit-learn 1.8)
+- pip
 
 ### Installation
 
 ```bash
 # Clone and setup
-git clone https://github.com/yourusername/agrosynapse.git
+git clone https://github.com/victoryoma1/agrosynapse.git
 cd agrosynapse
 
 # Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python -m venv .venv
 
-# Install dependencies
+# Activate it -- Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# Activate it -- macOS / Linux:
+source .venv/bin/activate
+
+# Install dependencies (dashboard + API included)
 pip install -r requirements.txt
-
-# Install Streamlit (for dashboard)
-pip install streamlit
 ```
+
+> **Windows:** `source .venv/bin/activate` does not work in PowerShell, and
+> pasting a trailing `# On Windows: ...` comment as a command creates a stray
+> directory. Use the PowerShell activation line above.
 
 ### Run the Full Pipeline
 
@@ -181,10 +181,15 @@ Use the API from a mobile or web client by POSTing survey records to `http://loc
 ## Testing and Quality
 
 ```bash
+# Install dev tooling
+pip install -r requirements-dev.txt
+
 # Lint and format
-black scripts/
-flake8 scripts/
+black scripts/ app_api.py
+flake8 scripts/ app_api.py
 ```
+
+> There is no automated test suite yet -- see the roadmap.
 
 ---
 
