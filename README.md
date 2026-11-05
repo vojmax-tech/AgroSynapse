@@ -145,7 +145,7 @@ agrosynapse/
 
 ```bash
 # Clone and setup
-git clone https://github.com/vicmax-tech/AgroSynapse.git
+git clone https://github.com/vojmax-tech/AgroSynapse.git
 cd AgroSynapse
 
 # Create virtual environment
