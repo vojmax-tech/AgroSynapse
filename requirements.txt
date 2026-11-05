@@ -1,15 +1,24 @@
-# Core data / ML stack (pinned to the versions in .venv, Python 3.11+)
-pandas==2.3.3
-numpy==2.4.3
-scikit-learn==1.8.0
-joblib==1.5.3
+# Runtime dependencies, pinned to the versions the committed model artefact was built
+# and verified against (Python 3.11 - see .python-version).
+#
+# scikit-learn is the pin that matters: data/processed/model_pipeline.joblib is a pickle
+# of a 1.9.0 estimator tree. Loading it under another minor version raises
+# InconsistentVersionWarning and is not guaranteed to predict identically. Bump this pin
+# and rerun scripts/run_pipeline.py together, never separately.
+
+# Core data / ML stack
+pandas==3.0.5
+numpy==2.4.6
+scikit-learn==1.9.0
+scipy==1.17.1
+joblib==1.6.0
 
 # Visualisation
-matplotlib==3.10.8
-altair==6.0.0
+matplotlib==3.11.1
+altair==6.2.2
 
 # Dashboard
-streamlit==1.55.0
+streamlit==1.63.0
 
 # Inference API (app_api.py)
 fastapi>=0.115

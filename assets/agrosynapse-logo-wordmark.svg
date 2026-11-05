@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="232" height="40" viewBox="0 0 232 40" fill="none" role="img" aria-label="AgroSynapse">
+  <!-- Sidebar logo: the mark from agrosynapse-sidebar-logo.svg scaled to 40px, plus the name.
+       Loaded through <img>, so the text uses system fonts rather than the page's web fonts. -->
+  <defs>
+    <linearGradient id="agroGradient" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6EE7A1"/>
+      <stop offset="1" stop-color="#2B9A58"/>
+    </linearGradient>
+  </defs>
+  <g transform="scale(0.625)">
+    <rect x="0.5" y="0.5" width="63" height="63" rx="17.5" fill="#0E1722" stroke="#7FCF9F" stroke-opacity="0.26"/>
+    <g transform="translate(-3 0)">
+      <circle cx="24" cy="35" r="5.5" fill="url(#agroGradient)"/>
+      <circle cx="46.5" cy="41.5" r="4.5" fill="url(#agroGradient)"/>
+      <path d="m 22.990802,34.936925 c 3.4,-6.2 6.9,-10.2 12.2,-12.2" stroke="url(#agroGradient)" stroke-width="3.4" stroke-linecap="round"/>
+      <path d="M24 35C29.2 36 36.6 38.4 46.5 41.5" stroke="url(#agroGradient)" stroke-width="3.4" stroke-linecap="round"/>
+      <path d="M 32.8,22.5 C 34.223653,13.001051 45.625624,11.278449 53.673324,16.209198 45.77365,19.244316 44.444522,29.618694 35.7,24.8 34,24.1 33.1,23.3 32.8,22.5 Z" fill="url(#agroGradient)"/>
+      <path d="m 54.410055,16.278307 c -10.873701,-0.796554 -19.609021,6.546656 -19.609021,6.546656 0,0 4.136576,-9.863885 19.609021,-6.546656 z" fill="#0e1722"/>
+    </g>
+  </g>
+  <text x="52" y="27.5" fill="#E7ECE9" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="21" font-weight="600" letter-spacing="-0.4">Agro<tspan fill="#7FCF9F">Synapse</tspan></text>
+</svg>

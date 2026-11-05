@@ -94,12 +94,16 @@ def main() -> None:
     predictions = model_pipeline.predict(input_df)
 
     out_df = df.copy()
-    out_df["predicted_yield_tons"] = predictions
+    # Name the column after the target actually trained on. It used to be hardcoded to
+    # "predicted_yield_tons", which mislabels the units for any other target and stops
+    # the dashboard from pairing predictions with actuals.
+    prediction_column = f"predicted_{args.target}" if args.target else "prediction"
+    out_df[prediction_column] = predictions
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(args.output, index=False)
 
-    LOGGER.info("Saved predictions to %s", args.output)
+    LOGGER.info("Saved predictions to %s (column: %s)", args.output, prediction_column)
 
 
 if __name__ == "__main__":

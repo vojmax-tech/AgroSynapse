@@ -19,7 +19,7 @@ import pandas as pd
 # Add scripts directory to path for relative imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from feature_config import APPROVED_FEATURES, is_risky_column, select_allowlisted_features
+from feature_config import APPROVED_FEATURES, is_risky_column, resolve_feature_columns
 
 
 def run(command: list[str]) -> None:
@@ -78,6 +78,7 @@ def pick_target_column(columns: list[str], preferred_target: str, df: pd.DataFra
         return preferred
 
     fallback_order = [
+        "yield_kg_per_ha",
         "yield_tons",
         "yield",
         "yield_kg",
@@ -227,13 +228,26 @@ def main() -> None:
 
     requested_features = parse_feature_list(args.features)
     target_for_selection = resolved_target if resolved_target is not None else args.target
-    selected_features, risky_in_allowlist, blocked_from_dataset = select_allowlisted_features(
-        available_columns, target_for_selection, requested_features
-    )
-    if risky_in_allowlist:
-        print(f"Info: dropping risky allowlisted features: {', '.join(risky_in_allowlist)}")
-    if blocked_from_dataset:
-        print(f"Info: blocked risky dataset columns: {', '.join(sorted(blocked_from_dataset))}")
+    decision = resolve_feature_columns(available_columns, target_for_selection, requested_features)
+    selected_features = list(decision["selected"])
+
+    if decision["risky_in_allowlist"]:
+        print(f"Info: dropping risky allowlisted features: {', '.join(decision['risky_in_allowlist'])}")
+    for column, why in sorted(decision["blocked"].items()):
+        print(f"Info: blocked '{column}' from features ({why}).")
+
+    # A partly-matching allowlist is the dangerous case: it yields a handful of columns,
+    # so the old `if not selected_features` fallback never fired and the model trained on
+    # whatever happened to overlap. resolve_feature_columns treats low coverage as a
+    # mismatch instead, and --strict-schema turns that into a hard failure.
+    if decision["fallback_used"]:
+        if args.strict_schema:
+            raise ValueError(
+                f"{decision['reason']} Refusing to continue while --strict-schema is enabled."
+            )
+        print(f"Warning: {decision['reason']}")
+    else:
+        print(f"Info: {decision['reason']}")
 
     if not selected_features:
         if args.strict_schema:
@@ -241,11 +255,6 @@ def main() -> None:
                 "No approved feature columns were found in the cleaned dataset while --strict-schema is enabled."
             )
         selected_features = auto_feature_candidates(available_columns, resolved_target)
-        if selected_features:
-            print(
-                "Info: no approved allowlisted features matched. "
-                f"Using {len(selected_features)} safe auto-selected feature(s)."
-            )
 
     if not selected_features:
         raise ValueError(

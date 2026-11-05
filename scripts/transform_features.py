@@ -23,7 +23,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-from feature_config import APPROVED_FEATURES, select_allowlisted_features
+from feature_config import APPROVED_FEATURES, resolve_feature_columns
 
 try:
     from joblib import dump as joblib_dump
@@ -155,18 +155,23 @@ def main() -> None:
 
     feature_allowlist = [x.strip() for x in str(args.features).split(",") if x.strip()]
     target_name_for_selection = target_col if target_col is not None else args.target
-    selected, risky_in_allowlist, blocked_from_dataset = select_allowlisted_features(
+    decision = resolve_feature_columns(
         df.columns.tolist(), target_name_for_selection, feature_allowlist
     )
+    selected = list(decision["selected"])
     if not selected:
         raise ValueError(
-            "No approved feature columns were found in the input dataset. "
-            "Update --features or check cleaned column names."
+            "No usable feature columns were found in the input dataset. Every column was "
+            "either the target, an identifier, or derived from the target."
         )
-    if risky_in_allowlist:
-        LOGGER.warning("Dropping risky allowlisted columns: %s", risky_in_allowlist)
-    if blocked_from_dataset:
-        LOGGER.info("Blocked leakage-prone columns from dataset: %s", sorted(blocked_from_dataset))
+    if decision["fallback_used"]:
+        LOGGER.warning("%s", decision["reason"])
+    else:
+        LOGGER.info("%s", decision["reason"])
+    if decision["risky_in_allowlist"]:
+        LOGGER.warning("Dropping risky allowlisted columns: %s", decision["risky_in_allowlist"])
+    for column, why in sorted(decision["blocked"].items()):
+        LOGGER.info("Blocked '%s' from features (%s).", column, why)
 
     feature_df = df[selected].copy()
     categorical_cols, numeric_cols = infer_feature_columns(feature_df, target=None)
@@ -182,7 +187,9 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     features_path = args.output_dir / "features.csv"
-    features_df.to_csv(features_path, index=False)
+    # Most columns are one-hot indicators, so writing full float repr triples the file
+    # size for no information ("0.0" -> "0"). %.6g keeps six significant digits.
+    features_df.to_csv(features_path, index=False, float_format="%.6g")
 
     LOGGER.info("Saved features to %s", features_path)
 

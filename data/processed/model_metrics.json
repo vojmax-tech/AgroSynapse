@@ -1,37 +1,45 @@
 {
-  "target": "yield_tons",
+  "target": "yield_kg_per_ha",
   "test_size": 0.2,
-  "n_train": 40,
-  "n_test": 10,
-  "mae": 11.226750000000026,
-  "rmse": 12.720523351556718,
-  "r2": -0.013336308519879214,
+  "n_train": 20244,
+  "n_test": 5061,
+  "mae": 512.6455117884449,
+  "rmse": 1538.6667190369394,
+  "r2": 0.9648756313406459,
   "model_type": "extra_trees",
   "candidate_metrics": {
     "random_forest": {
-      "mae": 11.231919473784318,
-      "rmse": 12.70718825517699,
-      "r2": -0.011212833868939232
+      "mae": 514.7866056332889,
+      "rmse": 1591.8356668169083,
+      "r2": 0.9624062309578302
     },
     "extra_trees": {
-      "mae": 11.226750000000026,
-      "rmse": 12.720523351556718,
-      "r2": -0.013336308519879214
+      "mae": 512.6455117884449,
+      "rmse": 1538.6667190369394,
+      "r2": 0.9648756313406459
     }
   },
   "baseline_metrics": {
-    "mae": 11.750999999999998,
-    "rmse": 12.958579590371778,
-    "r2": -0.05161905266001421
+    "mae": 4340.98390634262,
+    "rmse": 8947.162651374934,
+    "r2": -0.1876543707695717
   },
   "dataset_profile": {
-    "n_rows": 50,
-    "n_columns": 1,
-    "n_numeric_features": 0,
-    "n_categorical_features": 1,
-    "estimated_encoded_features": 5,
-    "high_cardinality_features": [],
-    "warnings": []
+    "n_rows": 25305,
+    "n_columns": 16,
+    "n_numeric_features": 14,
+    "n_categorical_features": 2,
+    "estimated_encoded_features": 91,
+    "high_cardinality_features": [
+      "country"
+    ],
+    "warnings": [
+      "High-cardinality categorical fields detected: country"
+    ]
+  },
+  "forest": {
+    "n_estimators": 80,
+    "min_samples_leaf": 20
   },
   "encoder": {
     "sparse_output": true,
@@ -39,27 +47,138 @@
     "max_categories": null
   },
   "features_used": [
-    "soil_type"
+    "country",
+    "crop",
+    "year",
+    "area_harvested_ha",
+    "fertilizer_kg_per_ha",
+    "arable_land_pct",
+    "agri_land_pct",
+    "rural_population_pct",
+    "agri_employment_pct",
+    "gdp_per_capita_usd",
+    "rural_electricity_pct",
+    "avg_precipitation_mm",
+    "yield_prev_year_kg_per_ha",
+    "yield_prev2_year_kg_per_ha",
+    "yield_prev3_mean_kg_per_ha",
+    "area_prev_year_ha"
   ],
-  "n_features": 1,
+  "n_features": 16,
+  "feature_selection": {
+    "selected": [
+      "country",
+      "crop",
+      "year",
+      "area_harvested_ha",
+      "fertilizer_kg_per_ha",
+      "arable_land_pct",
+      "agri_land_pct",
+      "rural_population_pct",
+      "agri_employment_pct",
+      "gdp_per_capita_usd",
+      "rural_electricity_pct",
+      "avg_precipitation_mm",
+      "yield_prev_year_kg_per_ha",
+      "yield_prev2_year_kg_per_ha",
+      "yield_prev3_mean_kg_per_ha",
+      "area_prev_year_ha"
+    ],
+    "eligible": [
+      "country",
+      "crop",
+      "year",
+      "area_harvested_ha",
+      "fertilizer_kg_per_ha",
+      "arable_land_pct",
+      "agri_land_pct",
+      "rural_population_pct",
+      "agri_employment_pct",
+      "gdp_per_capita_usd",
+      "rural_electricity_pct",
+      "avg_precipitation_mm",
+      "yield_prev_year_kg_per_ha",
+      "yield_prev2_year_kg_per_ha",
+      "yield_prev3_mean_kg_per_ha",
+      "area_prev_year_ha"
+    ],
+    "allowlist_matched": [
+      "country",
+      "crop",
+      "year",
+      "area_harvested_ha",
+      "fertilizer_kg_per_ha",
+      "arable_land_pct",
+      "agri_land_pct",
+      "rural_population_pct",
+      "agri_employment_pct",
+      "gdp_per_capita_usd",
+      "rural_electricity_pct",
+      "avg_precipitation_mm",
+      "yield_prev_year_kg_per_ha",
+      "yield_prev2_year_kg_per_ha",
+      "yield_prev3_mean_kg_per_ha",
+      "area_prev_year_ha"
+    ],
+    "risky_in_allowlist": [],
+    "coverage": 1.0,
+    "fallback_used": false,
+    "reason": "Allowlist matched 16 of 16 eligible columns (100%).",
+    "blocked": {
+      "country_iso3": "identifier or personal data",
+      "production_tonnes": "target-derived"
+    }
+  },
   "cv": {
     "mae": {
-      "mean": 11.778045864057777,
-      "std": 1.7185994394872166,
-      "ci95": 1.0651989683965912,
-      "n_folds": 10
+      "mean": 527.290949053525,
+      "std": 12.398057411328958,
+      "ci95": 10.867376470985235,
+      "n_folds": 5
     },
     "rmse": {
-      "mean": 13.554514259178465,
-      "std": 1.695410273202514,
-      "ci95": 1.0508261742265825,
-      "n_folds": 10
+      "mean": 1625.9629262480994,
+      "std": 111.40419021737193,
+      "ci95": 97.6500781833094,
+      "n_folds": 5
     },
     "r2": {
-      "mean": -0.12974482764299264,
-      "std": 0.20290320328158207,
-      "ci95": 0.12576070831513428,
-      "n_folds": 10
+      "mean": 0.9593449894436139,
+      "std": 0.005826985496450966,
+      "ci95": 0.005107577984196129,
+      "n_folds": 5
+    }
+  },
+  "temporal_holdout": {
+    "time_column": "year",
+    "train_periods": [
+      1990.0,
+      2017.0
+    ],
+    "test_periods": [
+      2018.0,
+      2024.0
+    ],
+    "n_train": 19955,
+    "n_test": 5350,
+    "model_type": "extra_trees",
+    "mae": 469.7858581196937,
+    "rmse": 1434.6791829915135,
+    "r2": 0.9771435196380549,
+    "baseline_metrics": {
+      "mae": 5120.208037383178,
+      "rmse": 10482.498237367785,
+      "r2": -0.22019532662646935
+    },
+    "persistence_metrics": {
+      "mae": 704.5118130841122,
+      "rmse": 2094.502955529425,
+      "r2": 0.9512851111192439,
+      "coverage": 0.9948,
+      "group_columns": [
+        "country",
+        "crop"
+      ]
     }
   }
 }

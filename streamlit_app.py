@@ -1,39 +1,40 @@
-﻿"""AgroSynapse Dashboard - Agricultural Survey Intelligence Platform."""
+"""AgroSynapse Dashboard - agricultural data quality, analysis and yield forecasting."""
 
 from __future__ import annotations
 
 import csv
 import html
+import io
 import json
 from datetime import datetime
+import os
 import re
 from pathlib import Path
 import subprocess
 import sys
 from typing import Any
-import uuid
 import warnings
 from textwrap import dedent
 
 import altair as alt
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from pandas.errors import ParserError
 
 st.set_page_config(
-    page_title="AgroSynapse | Agricultural Survey Intelligence",
-    page_icon="A",
+    page_title="AgroSynapse",
+    page_icon=":material/eco:",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 SETTINGS_PATH = Path("data/processed/app_settings.json")
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "raw_data_path": "data/raw/kobo_export_raw.csv",
-    "raw_fallback_path": "data/raw/kobo_export.csv",
+    # The committed demo source. kobo_export_raw.csv is the pipeline's ingest copy and is
+    # gitignored, so it only exists after a local pipeline run.
+    "raw_data_path": "data/raw/africa_crop_yield.csv",
+    "raw_fallback_path": "data/raw/kobo_export_raw.csv",
     "clean_data_path": "data/processed/clean_data.csv",
     "features_data_path": "data/processed/features.csv",
     "metrics_path": "data/processed/model_metrics.json",
@@ -46,7 +47,27 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 SIDEBAR_LOGO_PATH = ASSETS_DIR / "agrosynapse-sidebar-logo.svg"
+WORDMARK_LOGO_PATH = ASSETS_DIR / "agrosynapse-logo-wordmark.svg"
 _PROJECT_ROOT = Path(__file__).resolve().parent
+
+if str(_PROJECT_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
+
+from analysis import (  # noqa: E402
+    benchmark_against_peers,
+    compare_groups,
+    format_p,
+    group_difference_test,
+    iita_crop_group,
+    measure_label,
+    measure_unit,
+    period_means,
+    period_values,
+    quality_report,
+    trend_by_group,
+    write_summary,
+)
+from feature_config import is_risky_column  # noqa: E402
 
 
 def _safe_data_path(path_str: str) -> Path:
@@ -89,23 +110,71 @@ if "app_settings" not in st.session_state:
     st.session_state["app_settings"] = load_app_settings()
 
 
-def render_sidebar_brand() -> None:
-    if SIDEBAR_LOGO_PATH.exists():
-        try:
-            logo_markup = SIDEBAR_LOGO_PATH.read_text(encoding="utf-8")
-            st.sidebar.markdown(
-                f'''
-                <div class="sidebar-brand">
-                    <div class="sidebar-brand-mark">{logo_markup}</div>
-                    <div class="sidebar-brand-wordmark">AgroSynapse</div>
-                </div>
-                ''',
-                unsafe_allow_html=True,
-            )
-            return
-        except OSError:
-            pass
-    st.sidebar.markdown('<div class="sidebar-brand-fallback">AgroSynapse</div>', unsafe_allow_html=True)
+# -----------------------------------------------------------------------------
+# Deployment mode
+# -----------------------------------------------------------------------------
+# Streamlit serves every visitor from one container sharing one filesystem, so any
+# visitor who retrains the model or edits settings changes what everyone else sees. Demo
+# mode is therefore the default: read-only unless the operator opts in.
+#
+#   Local development:  set AGROSYNAPSE_MODE=full
+#   Hosted, with admin:  .streamlit/secrets.toml ->  [agrosynapse]
+#                                                    admin_password = "..."
+DEMO_NOTICE = (
+    "This is a shared demo. You can upload a CSV to explore it - it stays in your browser "
+    "session and is never saved. Saving files, retraining the model and changing settings "
+    "are turned off because every visitor shares one server."
+)
+
+
+def _secret(key: str) -> str | None:
+    try:
+        return str(st.secrets["agrosynapse"][key])
+    except Exception:
+        return None
+
+
+def admin_password() -> str | None:
+    return _secret("admin_password") or os.environ.get("AGROSYNAPSE_ADMIN_PASSWORD") or None
+
+
+def is_demo_mode() -> bool:
+    """True when shared-state writes (uploads, retraining, settings) are blocked."""
+    if st.session_state.get("admin_unlocked"):
+        return False
+    mode = (_secret("mode") or os.environ.get("AGROSYNAPSE_MODE") or "demo").strip().lower()
+    return mode != "full"
+
+
+def render_admin_unlock() -> None:
+    """Offer a password box so the operator can write on a hosted deployment."""
+    password = admin_password()
+    if not password or not is_demo_mode():
+        return
+    with st.sidebar.expander("Operator access", icon=":material/admin_panel_settings:"):
+        with st.form("admin_unlock_form", border=False):
+            entered = st.text_input("Admin password", type="password", key="admin_password_input")
+            unlock = st.form_submit_button("Unlock write access", key="admin_unlock_button", width="stretch")
+        if unlock:
+            if entered == password:
+                st.session_state["admin_unlocked"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+
+
+def flash(message: str) -> None:
+    """Rerun, then confirm with a toast; a toast raised right before a rerun is lost."""
+    st.session_state["flash_message"] = message
+    st.rerun()
+
+
+def guard_write_action(action: str) -> bool:
+    """Return True when a state-changing action may proceed; otherwise explain why not."""
+    if not is_demo_mode():
+        return True
+    st.warning(f"{action} is disabled in demo mode. {DEMO_NOTICE}")
+    return False
 
 
 def parse_hex_color(color_value: str | None) -> tuple[int, int, int] | None:
@@ -168,18 +237,25 @@ def theme_palette() -> dict[str, Any]:
 THEME = theme_palette()
 IS_DARK_THEME = bool(THEME["is_dark"])
 
-PAGE_CANVAS = THEME["bg"] if IS_DARK_THEME else "#f5f7f5"
-CARD_SURFACE = THEME["secondary_bg"] if IS_DARK_THEME else "#ffffff"
-SOFT_SURFACE = "#151f2a" if IS_DARK_THEME else "#eef3ef"
-SIDEBAR_SURFACE = "#0f1720" if IS_DARK_THEME else "#ffffff"
-CONTROL_SURFACE = "#121c27" if IS_DARK_THEME else "#f8faf8"
-CONTROL_BORDER = "rgba(127, 207, 159, 0.24)" if IS_DARK_THEME else "rgba(36, 49, 45, 0.12)"
-CARD_SHADOW = "0 18px 40px rgba(0, 0, 0, 0.24)" if IS_DARK_THEME else "0 10px 28px rgba(15, 23, 42, 0.06)"
-CARD_SHADOW_HOVER = "0 22px 44px rgba(0, 0, 0, 0.28)" if IS_DARK_THEME else "0 14px 32px rgba(15, 23, 42, 0.08)"
+# Categorical palette for crop legends and donut segments. Defined once so the
+# legend chips and the arc they describe cannot drift apart.
+CHART_PALETTE: list[str] = [
+    "#52d273",
+    "#34c2a6",
+    "#49a9f1",
+    "#8479ff",
+    "#d26cf3",
+    "#f39a58",
+    "#f0627a",
+    "#b6d657",
+]
 
 # -----------------------------------------------------------------------------
 # Styling
 # -----------------------------------------------------------------------------
+# The stylesheet in assets/theme_static.css is the single source of truth for
+# every visual token. Values that depend on runtime state are injected below as
+# custom-property overrides rather than as a second, competing stylesheet.
 _STATIC_CSS_PATH = ASSETS_DIR / "theme_static.css"
 if _STATIC_CSS_PATH.exists():
     st.markdown(
@@ -188,1327 +264,37 @@ if _STATIC_CSS_PATH.exists():
     )
 
 
-st.markdown(
-    f"""
-    <style>
-    :root {{
-        --bg-soft: {THEME["bg"]} !important;
-        --card: {THEME["secondary_bg"]} !important;
-        --ink: {THEME["text"]} !important;
-        --muted: {THEME["muted"]} !important;
-        --line: {THEME["line"]} !important;
-        --surface-soft: {THEME["bg"]} !important;
-        --surface-elevated: {THEME["secondary_bg"]} !important;
-    }}
-
-    [data-testid="stAppViewContainer"] {{
-        background:
-            radial-gradient(circle at top right, rgba(127, 207, 159, 0.06), transparent 32%),
-            linear-gradient(180deg, rgba(127, 207, 159, 0.035), transparent 28%),
-            var(--bg-soft) !important;
-    }}
-
-    section[data-testid="stSidebar"],
-    section[data-testid="stSidebar"] > div,
-    section[data-testid="stSidebar"] > div:first-child,
-    div[data-testid="stSidebarContent"],
-    div[data-testid="stSidebarUserContent"],
-    [data-testid="stSidebarNav"],
-    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{
-        background: var(--card) !important;
-        background-color: var(--card) !important;
-        opacity: 1 !important;
-        backdrop-filter: none !important;
-        -webkit-backdrop-filter: none !important;
-    }}
-
-    .page-hero,
-    .dashboard-header {{
-        background:
-            radial-gradient(circle at 88% 18%, rgba(127, 207, 159, 0.26), transparent 28%),
-            radial-gradient(circle at 12% 92%, rgba(255, 255, 255, 0.08), transparent 24%),
-            linear-gradient(120deg, #173f27 0%, #1f6b3b 42%, #2b8a4b 100%);
-        border: 1px solid rgba(212, 229, 216, 0.24);
-        border-radius: 30px;
-        padding: 2.35rem 2.55rem;
-        margin-bottom: 1.7rem;
-        box-shadow: 0 30px 56px rgba(10, 18, 28, 0.18);
-        position: relative;
-        overflow: hidden;
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-end;
-        gap: 1.45rem;
-        flex-wrap: wrap;
-    }}
-
-    .page-hero::before,
-    .dashboard-header::before {{
-        width: 240px;
-        height: 240px;
-        background: radial-gradient(circle, rgba(255,255,255,0.14) 0%, transparent 72%);
-        transform: translate(42%, -46%);
-    }}
-
-    .page-hero .title-block,
-    .dashboard-header .title-block {{
-        max-width: min(46rem, 100%);
-    }}
-
-    .page-hero-eyebrow {{
-        color: rgba(232, 245, 235, 0.82);
-        text-transform: uppercase;
-        letter-spacing: 0.12em;
-        font-size: 0.74rem;
-        font-weight: 700;
-        margin-bottom: 0.6rem;
-    }}
-
-    .page-hero h1,
-    .dashboard-header h1 {{
-        margin: 0;
-        font-size: clamp(2rem, 2.7vw, 2.7rem);
-        line-height: 0.98;
-        color: white !important;
-        letter-spacing: -0.015em;
-    }}
-
-    .page-hero-copy,
-    .dashboard-subtitle {{
-        margin: 1.05rem 0 0 0;
-        color: rgba(232, 245, 235, 0.95);
-        font-size: 1rem;
-        line-height: 1.72;
-        max-width: 47rem;
-    }}
-
-    .page-hero-badges {{
-        display: flex;
-        align-items: stretch;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-        gap: 0.9rem;
-        position: relative;
-        z-index: 1;
-    }}
-
-    .page-badge {{
-        min-width: 164px;
-        padding: 1rem 1.1rem;
-        border-radius: 20px;
-        background: rgba(255, 255, 255, 0.12);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        backdrop-filter: blur(8px);
-        -webkit-backdrop-filter: blur(8px);
-        box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
-    }}
-
-    .page-badge-label {{
-        display: block;
-        color: rgba(232, 245, 235, 0.76);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        font-size: 0.68rem;
-        font-weight: 700;
-        margin-bottom: 0.38rem;
-    }}
-
-    .page-badge-value {{
-        display: block;
-        color: white;
-        font-size: 1rem;
-        font-weight: 700;
-        line-height: 1.45;
-    }}
-
-    .kpi-card {{
-        background:
-            linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02) 44%, transparent 100%),
-            var(--card);
-        border: 1px solid rgba(127, 207, 159, 0.22);
-        border-left: 4px solid var(--brand);
-        border-radius: 24px;
-        padding: 1.25rem 1.3rem 1.2rem 1.3rem;
-        min-height: 150px;
-        margin-bottom: 0.45rem;
-        box-shadow: 0 16px 36px rgba(10, 18, 28, 0.08);
-        transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
-        position: relative;
-        overflow: hidden;
-        display: flex;
-        flex-direction: column;
-        gap: 0.9rem;
-        align-items: stretch;
-    }}
-
-    .kpi-card.no-icon {{
-        gap: 0.8rem;
-    }}
-
-    .kpi-card-top {{
-        display: flex;
-        align-items: center;
-        gap: 0.8rem;
-        min-height: 48px;
-    }}
-
-    .kpi-card-top.no-icon {{
-        min-height: auto;
-    }}
-
-    .kpi-card::before {{
-        height: 0;
-        display: none;
-    }}
-
-    .kpi-card::after {{
-        content: '';
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
-        background: radial-gradient(circle at top right, rgba(255,255,255,0.08), transparent 30%);
-    }}
-
-    .kpi-card:hover {{
-        transform: translateY(-3px);
-        box-shadow: 0 20px 42px rgba(10, 18, 28, 0.12);
-        border-color: rgba(127, 207, 159, 0.34);
-    }}
-
-    .kpi-icon {{
-        width: 48px;
-        height: 48px;
-        display: grid;
-        place-items: center;
-        border-radius: 15px;
-        background: rgba(31, 107, 59, 0.1);
-        border: 1px solid rgba(31, 107, 59, 0.14);
-        color: var(--brand);
-        font-size: 1rem;
-        box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
-        flex: 0 0 48px;
-    }}
-
-    .kpi-card-meta {{
-        display: grid;
-        gap: 0.38rem;
-        align-content: start;
-        min-width: 0;
-    }}
-
-    .kpi-label {{
-        color: var(--muted);
-        font-size: 0.74rem;
-        margin-bottom: 0;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        line-height: 1.24;
-    }}
-
-    .kpi-value {{
-        color: var(--ink);
-        font-size: clamp(1.6rem, 2.2vw, 2.05rem);
-        font-weight: 800;
-        margin-bottom: 0;
-        line-height: 1.04;
-        white-space: normal;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }}
-
-    .kpi-delta {{
-        color: var(--muted);
-        font-size: 0.84rem;
-        font-weight: 600;
-        margin-top: auto;
-        line-height: 1.58;
-        min-height: 2.65em;
-        display: flex;
-        align-items: flex-end;
-    }}
-
-    .kpi-delta-empty {{
-        visibility: hidden;
-    }}
-
-    .panel {{
-        background: linear-gradient(180deg, rgba(255,255,255,0.045), transparent 100%), var(--card);
-        border: 1px solid rgba(127, 207, 159, 0.18);
-        border-radius: 24px;
-        padding: 1.15rem 1.25rem;
-        margin: 2.15rem 0 1.15rem;
-        box-shadow: 0 12px 26px rgba(10, 18, 28, 0.05);
-    }}
-
-    .panel h4 {{
-        font-size: 1.08rem;
-        letter-spacing: 0.01em;
-    }}
-
-    .plain-note {{
-        background: linear-gradient(180deg, rgba(127, 207, 159, 0.08), rgba(127, 207, 159, 0.04));
-        border: 1px solid rgba(31, 107, 59, 0.16);
-        border-radius: 22px;
-        padding: 1.1rem 1.2rem;
-        color: var(--ink);
-        line-height: 1.7;
-        margin-bottom: 1.2rem;
-        max-width: none;
-        box-shadow: 0 12px 24px rgba(10, 18, 28, 0.04);
-    }}
-
-    .smart-insight-card {{
-        background: linear-gradient(180deg, rgba(255,255,255,0.045), transparent 100%), var(--card);
-        border: 1px solid rgba(127, 207, 159, 0.18);
-        border-radius: 24px;
-        padding: 1.15rem 1.2rem 1.15rem 1.2rem;
-        min-height: 196px;
-        position: relative;
-        overflow: hidden;
-        box-shadow: 0 14px 32px rgba(10, 18, 28, 0.06);
-        margin-bottom: 0.6rem;
-    }}
-
-    .smart-insight-card::before {{
-        content: '';
-        position: absolute;
-        inset: 0 0 auto 0;
-        height: 4px;
-        background: linear-gradient(90deg, #52d273 0%, #34c2a6 100%);
-        opacity: 0.95;
-    }}
-
-    .smart-insight-card.warning::before {{
-        background: linear-gradient(90deg, #f7b267 0%, #f39a58 100%);
-    }}
-
-    .smart-insight-card.neutral::before {{
-        background: linear-gradient(90deg, #7db7ff 0%, #8479ff 100%);
-    }}
-
-    .smart-insight-card.accent::before {{
-        background: linear-gradient(90deg, #d26cf3 0%, #8479ff 100%);
-    }}
-
-    .insight-kicker {{
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        font-size: 0.7rem;
-        font-weight: 700;
-        margin-bottom: 0.55rem;
-    }}
-
-    .insight-title {{
-        font-family: 'Space Grotesk', 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-        font-size: 1.18rem;
-        font-weight: 700;
-        color: var(--ink);
-        line-height: 1.2;
-        margin-bottom: 0.55rem;
-        letter-spacing: -0.01em;
-    }}
-
-    .insight-body {{
-        color: var(--ink);
-        font-size: 0.94rem;
-        line-height: 1.65;
-    }}
-
-    .insight-footnote {{
-        margin-top: 0.8rem;
-        color: var(--muted);
-        font-size: 0.8rem;
-        line-height: 1.5;
-    }}
-
-    .smart-summary-title {{
-        font-size: 0.78rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        color: var(--muted);
-        margin-bottom: 0.38rem;
-    }}
-
-    .smart-summary-body {{
-        color: var(--ink);
-        font-size: 0.96rem;
-        line-height: 1.72;
-    }}
-
-    .stTabs [role="tablist"] {{
-        gap: 0.65rem;
-        margin-bottom: 0.95rem;
-    }}
-
-    .stTabs [role="tab"] {{
-        border-radius: 999px !important;
-        padding: 0.62rem 1.08rem !important;
-        border: 1px solid rgba(127, 207, 159, 0.18) !important;
-        background: rgba(127, 207, 159, 0.04) !important;
-    }}
-
-    .stTabs [role="tab"][aria-selected="true"] {{
-        background: rgba(31, 107, 59, 0.12) !important;
-        border-color: rgba(31, 107, 59, 0.24) !important;
-    }}
-
-    [data-testid="stExpander"] {{
-        border: 1px solid rgba(127, 207, 159, 0.18) !important;
-        border-radius: 20px !important;
-        background: linear-gradient(180deg, rgba(255,255,255,0.03), transparent 100%), var(--card) !important;
-        overflow: hidden;
-        margin-bottom: 0.5rem;
-    }}
-
-    [data-testid="stExpander"] details {{
-        border: none !important;
-    }}
-
-
-    .view-gap {{
-        margin-top: 0.35rem;
-        margin-bottom: 1.1rem;
-    }}
-
-    .section-gap {{
-        margin-top: 1rem;
-    }}
-
-    .stack-gap {{
-        height: 1.45rem;
-    }}
-
-    .kpi-row-gap {{
-        height: 1rem;
-    }}
-
-    @media (max-width: 768px) {{
-        section[data-testid="stSidebar"],
-        section[data-testid="stSidebar"] > div,
-        section[data-testid="stSidebar"] > div:first-child,
-        div[data-testid="stSidebarContent"],
-        div[data-testid="stSidebarUserContent"] {{
-            background: var(--card) !important;
-            background-color: var(--card) !important;
-            opacity: 1 !important;
-            backdrop-filter: none !important;
-            -webkit-backdrop-filter: none !important;
-        }}
-
-        .page-hero,
-        .dashboard-header {{
-            padding: 1.5rem 1.3rem;
-            border-radius: 25px;
-            align-items: flex-start;
-            gap: 1rem;
-        }}
-
-        .page-hero-badges {{
-            width: 100%;
-            justify-content: flex-start;
-        }}
-
-        .page-badge {{
-            min-width: 132px;
-            flex: 1 1 148px;
-            padding: 0.95rem 1rem;
-        }}
-
-        .kpi-card {{
-            min-height: 144px;
-            padding: 1.1rem 1.05rem;
-            gap: 0.82rem;
-        }}
-
-        .kpi-card-top {{
-            gap: 0.72rem;
-            min-height: 44px;
-        }}
-
-        .kpi-icon {{
-            width: 44px;
-            height: 44px;
-            flex-basis: 44px;
-        }}
-
-        .smart-insight-card {{
-            min-height: 0;
-            padding: 1rem 1.05rem;
-        }}
-
-        .panel {{
-            padding: 1rem 1.05rem;
-        }}
-    }}
-
-    @media (max-width: 480px) {{
-        .page-hero,
-        .dashboard-header {{
-            padding: 1.18rem 1rem;
-        }}
-
-        .kpi-card {{
-            min-height: 138px;
-            border-radius: 22px;
-            padding: 1rem 0.95rem;
-        }}
-
-        .kpi-value {{
-            font-size: 1.5rem;
-        }}
-    }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-st.markdown(
-    f"""
-    <style>
-    :root {{
-        --page-bg: var(--background-color, {PAGE_CANVAS});
-        --card-bg: var(--secondary-background-color, {CARD_SURFACE});
-        --sidebar-bg: var(--secondary-background-color, {SIDEBAR_SURFACE});
-        --soft-surface: {SOFT_SURFACE};
-        --control-bg: {CONTROL_SURFACE};
-        --control-border: {CONTROL_BORDER};
-        --line-soft: {THEME["line"]};
-        --ink: var(--text-color, {THEME["text"]});
-        --muted: {THEME["muted"]};
-        --card-shadow-strong: {CARD_SHADOW};
-        --card-shadow-hover: {CARD_SHADOW_HOVER};
-        --tab-shadow-active: {('0 8px 20px rgba(0, 0, 0, 0.18)' if IS_DARK_THEME else '0 8px 18px rgba(15, 23, 42, 0.06)')};
-        --space-page-y: 1.1rem;
-        --space-page-x: 1rem;
-        --space-page-bottom: 2.1rem;
-        --space-sidebar-y: 0.72rem;
-        --space-sidebar-x: 0.6rem;
-        --space-tight: 0.5rem;
-        --space-regular: 0.95rem;
-        --space-loose: 1.05rem;
-    }}
-
-    .stApp,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stAppViewContainer"] > .main {{
-        background: var(--page-bg) !important;
-        background-image: none !important;
-    }}
-
-    [data-testid="stMainBlockContainer"] {{
-        padding-top: var(--space-page-y) !important;
-        padding-left: var(--space-page-x) !important;
-        padding-right: var(--space-page-x) !important;
-        padding-bottom: var(--space-page-bottom) !important;
-        max-width: none !important;
-    }}
-
-    h2, h3, h4 {{
-        color: var(--ink) !important;
-        margin-top: 0.9rem !important;
-    }}
-
-    .stMarkdown h2,
-    .stMarkdown h3,
-    .stMarkdown h4,
-    .stMarkdown p,
-    .stMarkdown ul,
-    .stMarkdown ol {{
-        margin-bottom: 0.9rem !important;
-    }}
-
-    div[data-testid="column"] > div[data-testid="stVerticalBlock"] {{
-        gap: 0.68rem !important;
-    }}
-
-    .stCaption {{
-        margin-top: 0.15rem !important;
-        margin-bottom: 0.55rem !important;
-        color: var(--muted) !important;
-    }}
-
-    .sidebar-nav-title {{
-        margin: 0.1rem 0 0.45rem 0.12rem;
-        font-size: 0.66rem;
-        letter-spacing: 0.09em;
-        text-transform: uppercase;
-        font-weight: 700;
-        color: rgba(231, 236, 233, 0.55);
-    }}
-
-    section[data-testid="stSidebar"],
-    section[data-testid="stSidebar"] > div,
-    section[data-testid="stSidebar"] > div:first-child,
-    div[data-testid="stSidebarContent"],
-    div[data-testid="stSidebarUserContent"],
-    [data-testid="stSidebar"] [data-testid="stVerticalBlock"],
-    [data-testid="stSidebarNav"] {{
-        background: var(--sidebar-bg) !important;
-        background-color: var(--sidebar-bg) !important;
-        background-image: none !important;
-        opacity: 1 !important;
-        backdrop-filter: none !important;
-        -webkit-backdrop-filter: none !important;
-    }}
-
-    section[data-testid="stSidebar"] {{
-        border-right: 1px solid var(--line-soft) !important;
-        box-shadow: none !important;
-    }}
-
-    section[data-testid="stSidebar"][aria-expanded="true"] {{
-        min-width: 252px !important;
-        max-width: 252px !important;
-    }}
-
-    [data-testid="stSidebar"] .block-container {{
-        padding: var(--space-sidebar-y) var(--space-sidebar-x) 1rem !important;
-    }}
-
-    .sidebar-brand {{
-        display: flex;
-        align-items: center;
-        gap: 0.72rem;
-        margin: 0.08rem 0 0.9rem 0.08rem;
-    }}
-
-    .sidebar-brand-mark {{
-        flex: 0 0 auto;
-    }}
-
-    .sidebar-brand svg {{
-        display: block;
-        width: 48px;
-        height: auto;
-    }}
-
-    .sidebar-brand-wordmark {{
-        color: #f5f8f6;
-        font-size: 1.02rem;
-        font-weight: 700;
-        letter-spacing: -0.025em;
-        line-height: 1;
-    }}
-
-    .sidebar-brand-fallback {{
-        margin: 0.15rem 0 0.85rem 0.08rem;
-        color: var(--ink);
-        font-size: 1rem;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-    }}
-
-    [data-testid="stSidebar"] .stRadio {{
-        margin-bottom: 0.85rem !important;
-    }}
-
-    [data-testid="stSidebar"] .stRadio > label {{
-        display: none !important;
-    }}
-
-    [data-testid="stSidebar"] .stRadio [role="radiogroup"] {{
-        gap: 0.16rem !important;
-    }}
-
-    [data-testid="stSidebar"] label[data-baseweb="radio"] {{
-        width: 100% !important;
-        align-items: stretch !important;
-        margin: 0 !important;
-    }}
-
-    [data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child {{
-        display: none !important;
-    }}
-
-    [data-testid="stSidebar"] label[data-baseweb="radio"] > div:last-child {{
-        width: 100% !important;
-    }}
-
-    [data-testid="stSidebar"] label[data-baseweb="radio"] p {{
-        width: 100% !important;
-        margin: 0 !important;
-        padding: 0.58rem 0.7rem 0.58rem 0.82rem !important;
-        border-radius: 12px !important;
-        border: 1px solid transparent !important;
-        font-size: 0.86rem !important;
-        font-weight: 500 !important;
-        line-height: 1.18 !important;
-        color: rgba(231, 236, 233, 0.76) !important;
-        letter-spacing: -0.01em !important;
-        text-align: left !important;
-        transition: background 140ms ease, border-color 140ms ease, color 140ms ease !important;
-    }}
-
-    [data-testid="stSidebar"] label[data-baseweb="radio"]:hover p {{
-        background: rgba(127, 207, 159, 0.07) !important;
-        border-color: rgba(127, 207, 159, 0.12) !important;
-        color: rgba(255, 255, 255, 0.96) !important;
-    }}
-
-    [data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) p {{
-        background: rgba(127, 207, 159, 0.12) !important;
-        border-color: rgba(127, 207, 159, 0.22) !important;
-        color: #ffffff !important;
-        font-weight: 600 !important;
-        box-shadow: inset 3px 0 0 rgba(82, 210, 115, 0.92) !important;
-    }}
-
-    [data-testid="stSidebar"] [data-testid="stExpander"] {{
-        margin-top: 0.5rem !important;
-        border-radius: 14px !important;
-    }}
-
-    [data-testid="stSidebar"] [data-testid="stExpander"] summary {{
-        padding: 0.7rem 0.82rem !important;
-    }}
-
-    [data-testid="stSidebar"] [data-testid="stExpander"] summary p {{
-        font-size: 0.84rem !important;
-        font-weight: 600 !important;
-        color: rgba(255, 255, 255, 0.88) !important;
-    }}
-
-    .stSidebar .stCaption,
-    .stSidebar .stCaption span {{
-        font-size: 0.82rem !important;
-        font-weight: 600 !important;
-        color: rgba(231, 236, 233, 0.7) !important;
-        letter-spacing: 0.01em !important;
-    }}
-
-    .page-topbar {{
-        display: flex;
-        align-items: center;
-        gap: 0.85rem;
-        margin: 0 0 var(--space-regular) 0;
-    }}
-
-    .page-topbar-title {{
-        font-family: 'Space Grotesk', 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
-        font-size: clamp(1.55rem, 2vw, 2rem);
-        font-weight: 700;
-        letter-spacing: -0.03em;
-        line-height: 1.02;
-        color: var(--ink);
-        margin: 0;
-        white-space: nowrap;
-    }}
-
-    .page-topbar-rule {{
-        flex: 1 1 auto;
-        height: 1px;
-        border-radius: 999px;
-        background: var(--line-soft);
-    }}
-
-    .stTabs [role="tablist"] {{
-        gap: 0.6rem !important;
-        margin-bottom: 1rem !important;
-    }}
-
-    .stTabs [role="tab"] {{
-        background: var(--soft-surface) !important;
-        border: 1px solid var(--line-soft) !important;
-        border-radius: 999px !important;
-        color: var(--muted) !important;
-        min-height: auto !important;
-        padding: 0.5rem 0.88rem !important;
-    }}
-
-    .stTabs [role="tab"][aria-selected="true"] {{
-        background: var(--card-bg) !important;
-        color: var(--ink) !important;
-        box-shadow: var(--tab-shadow-active) !important;
-    }}
-
-    .kpi-card {{
-        background: var(--card-bg) !important;
-        border: 1px solid var(--line-soft) !important;
-        border-left: 1px solid var(--line-soft) !important;
-        border-radius: 20px !important;
-        padding: 0.96rem 1rem 0.92rem 1rem !important;
-        min-height: 128px !important;
-        margin-bottom: 0.42rem !important;
-        gap: 0.66rem !important;
-        box-shadow: var(--card-shadow-strong) !important;
-        overflow: hidden;
-    }}
-
-    .kpi-card::before {{
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        height: 3px;
-        background: linear-gradient(90deg, var(--accent, var(--brand)), rgba(0,0,0,0) 72%);
-        display: block !important;
-    }}
-
-    .kpi-card::after {{
-        display: none !important;
-    }}
-
-    .kpi-card:hover {{
-        transform: translateY(-2px) !important;
-        box-shadow: var(--card-shadow-hover) !important;
-        border-color: var(--line-soft) !important;
-    }}
-
-    .kpi-card-top {{
-        display: flex !important;
-        align-items: flex-start !important;
-        justify-content: space-between !important;
-        gap: 0.75rem !important;
-        min-height: auto !important;
-    }}
-
-    .kpi-card.no-icon .kpi-card-top {{
-        justify-content: flex-start !important;
-    }}
-
-    .kpi-icon {{
-        order: 2;
-        margin-left: auto;
-        width: 34px !important;
-        height: 34px !important;
-        border-radius: 12px !important;
-        flex: 0 0 34px !important;
-        box-shadow: none !important;
-    }}
-
-    .kpi-card.no-icon .kpi-icon {{
-        display: none !important;
-    }}
-
-    .kpi-label {{
-        order: 1;
-        font-size: 0.72rem !important;
-        font-weight: 700 !important;
-        letter-spacing: 0.08em !important;
-        line-height: 1.25 !important;
-    }}
-
-    .kpi-value {{
-        font-size: clamp(1.65rem, 2.1vw, 2.2rem) !important;
-        line-height: 0.98 !important;
-        letter-spacing: -0.035em !important;
-        margin: 0 !important;
-    }}
-
-    .kpi-delta {{
-        font-size: 0.76rem !important;
-        line-height: 1.4 !important;
-        min-height: 1.1em !important;
-        margin-top: auto !important;
-        color: var(--muted) !important;
-    }}
-
-    .panel,
-    .smart-insight-card,
-    .plain-note,
-    .donut-wrap {{
-        background: var(--card-bg) !important;
-        border: 1px solid var(--line-soft) !important;
-        border-radius: 20px !important;
-        box-shadow: var(--card-shadow-strong) !important;
-    }}
-
-    .panel {{
-        padding: 0.82rem 1rem !important;
-        margin: 1.08rem 0 0.86rem !important;
-    }}
-
-    .panel h4 {{
-        margin: 0 !important;
-        font-size: 1rem !important;
-        font-weight: 700 !important;
-    }}
-
-    .smart-insight-card {{
-        min-height: 152px !important;
-        padding: 1rem !important;
-    }}
-
-    .plain-note {{
-        padding: 0.96rem 1rem !important;
-    }}
-
-    .soft-section-title {{
-        font-size: 1rem !important;
-        margin-bottom: 0.22rem !important;
-        font-weight: 700 !important;
-    }}
-
-    .section-hint {{
-        font-size: 0.84rem !important;
-        margin-bottom: 0.76rem !important;
-    }}
-
-    .view-gap {{
-        display: block !important;
-        height: 0.62rem !important;
-        margin: 0 !important;
-    }}
-
-    .section-gap {{
-        display: block !important;
-        height: 0.76rem !important;
-        margin: 0 !important;
-    }}
-
-    .kpi-row-gap {{
-        display: block !important;
-        height: 0.54rem !important;
-        margin: 0 !important;
-    }}
-
-    .stack-gap {{
-        height: 1.04rem !important;
-    }}
-
-    .insight-row-gap {{
-        height: 1.05rem !important;
-    }}
-
-    .upload-preview-card-gap {{
-        height: 1.15rem !important;
-    }}
-
-    .crop-legend {{
-        gap: 0.45rem 0.55rem !important;
-        margin-top: 0.72rem !important;
-    }}
-
-    .legend-chip {{
-        box-shadow: none !important;
-    }}
-
-    .smart-summary-title {{
-        font-size: 0.72rem;
-        font-weight: 700;
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        margin-bottom: 0.35rem;
-    }}
-
-    .smart-summary-body {{
-        color: var(--ink);
-        line-height: 1.6;
-        font-size: 0.94rem;
-    }}
-
-    .kpi-value,
-    .insight-title,
-    .insight-body,
-    .panel h4,
-    .soft-section-title {{
-        color: var(--ink) !important;
-    }}
-
-    .kpi-label,
-    .kpi-delta,
-    .section-hint,
-    .insight-kicker,
-    .insight-footnote,
-    .smart-summary-title {{
-        color: var(--muted) !important;
-    }}
-
-    .stButton > button {{
-        background: var(--card-bg) !important;
-        color: var(--ink) !important;
-        border: 1px solid var(--control-border) !important;
-        border-radius: 999px !important;
-        padding: 0.66rem 1rem !important;
-        box-shadow: none !important;
-    }}
-
-    .stButton > button:hover {{
-        border-color: rgba(31, 107, 59, 0.45) !important;
-        box-shadow: none !important;
-    }}
-
-    .stButton > button[kind="primary"] {{
-        background: #1f6b3b !important;
-        color: white !important;
-        border-color: #1f6b3b !important;
-    }}
-
-    .stFileUploader > div > div > div > div,
-    .stSelectbox > div > div,
-    .stTextInput > div > div,
-    .stNumberInput > div > div,
-    .stTextArea > div > div {{
-        background: var(--control-bg) !important;
-        border-color: var(--control-border) !important;
-        border-radius: 14px !important;
-    }}
-
-    .stSelectbox,
-    .stTextInput,
-    .stNumberInput,
-    .stTextArea,
-    .stFileUploader,
-    .stToggle,
-    .stSlider,
-    .stRadio,
-    .stMultiSelect {{
-        margin-bottom: 0.65rem !important;
-    }}
-
-    div[data-testid="stForm"] {{
-        background: var(--card-bg) !important;
-        border: 1px solid var(--line-soft) !important;
-        border-radius: 20px !important;
-        padding: 1rem 1.05rem !important;
-        box-shadow: var(--card-shadow-strong) !important;
-    }}
-
-    div[data-testid="stVerticalBlockBorderWrapper"] {{
-        background: var(--card-bg) !important;
-        border: 1px solid var(--line-soft) !important;
-        border-radius: 20px !important;
-        padding: 1.05rem !important;
-        box-shadow: var(--card-shadow-strong) !important;
-    }}
-
-    div[data-testid="stVerticalBlockBorderWrapper"] > div[data-testid="stVerticalBlock"] {{
-        gap: 1.05rem !important;
-    }}
-
-    .upload-section-heading {{
-        margin: 0.25rem 0 1.35rem !important;
-        max-width: 52rem;
-    }}
-
-    .upload-section-heading.secondary {{
-        margin-top: 0.35rem !important;
-    }}
-
-    .upload-section-kicker {{
-        color: var(--brand) !important;
-        font-size: 0.72rem !important;
-        font-weight: 800 !important;
-        letter-spacing: 0 !important;
-        line-height: 1.2 !important;
-        margin-bottom: 0.34rem !important;
-        text-transform: uppercase !important;
-    }}
-
-    .upload-section-heading h2 {{
-        color: var(--ink) !important;
-        font-family: 'Space Grotesk', 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
-        font-size: clamp(1.55rem, 2.1vw, 2rem) !important;
-        font-weight: 800 !important;
-        letter-spacing: 0 !important;
-        line-height: 1.05 !important;
-        margin: 0 !important;
-    }}
-
-    .upload-section-heading p {{
-        color: var(--muted) !important;
-        font-size: 0.94rem !important;
-        line-height: 1.62 !important;
-        margin: 0.55rem 0 0 !important;
-        max-width: 42rem !important;
-    }}
-
-    .upload-panel-heading {{
-        align-items: flex-start;
-        display: flex;
-        gap: 0.78rem;
-        margin-bottom: 0.55rem !important;
-    }}
-
-    .upload-panel-heading.compact {{
-        margin-bottom: 1.15rem !important;
-        margin-top: 0.12rem !important;
-    }}
-
-    .upload-panel-step {{
-        align-items: center;
-        background: rgba(127, 207, 159, 0.12);
-        border: 1px solid rgba(127, 207, 159, 0.22);
-        border-radius: 999px;
-        color: var(--brand);
-        display: inline-flex;
-        flex: 0 0 auto;
-        font-size: 0.68rem;
-        font-weight: 800;
-        letter-spacing: 0;
-        line-height: 1;
-        min-height: 1.65rem;
-        padding: 0.48rem 0.66rem;
-        text-transform: uppercase;
-    }}
-
-    .upload-subsection-label {{
-        align-items: center;
-        color: var(--muted) !important;
-        display: flex;
-        font-size: 0.74rem !important;
-        font-weight: 800 !important;
-        letter-spacing: 0 !important;
-        line-height: 1.2 !important;
-        margin: 1.08rem 0 0.52rem !important;
-        text-transform: uppercase !important;
-    }}
-
-    .upload-subsection-label::after {{
-        background: var(--line-soft);
-        content: '';
-        display: block;
-        flex: 1 1 auto;
-        height: 1px;
-        margin-left: 0.72rem;
-    }}
-
-    .upload-panel-divider {{
-        border-top: 1px solid var(--line-soft);
-        margin: 1.35rem 0 0.95rem;
-    }}
-
-    .upload-panel-title {{
-        color: var(--ink) !important;
-        font-size: 1.06rem !important;
-        font-weight: 800 !important;
-        letter-spacing: 0 !important;
-        line-height: 1.18 !important;
-        margin-bottom: 0.18rem !important;
-    }}
-
-    .upload-panel-note {{
-        color: var(--muted) !important;
-        font-size: 0.86rem !important;
-        line-height: 1.7 !important;
-        margin-bottom: 0 !important;
-    }}
-
-    div[data-testid="stFileUploaderDropzone"] {{
-        align-items: center !important;
-        background: rgba(127, 207, 159, 0.075) !important;
-        border: 2px dashed rgba(127, 207, 159, 0.48) !important;
-        border-radius: 18px !important;
-        min-height: 11rem !important;
-        padding: 1.35rem 1.45rem !important;
-        transition: background 0.18s ease, border-color 0.18s ease !important;
-    }}
-
-    div[data-testid="stFileUploaderDropzone"]:hover {{
-        background: rgba(127, 207, 159, 0.11) !important;
-        border-color: rgba(127, 207, 159, 0.72) !important;
-    }}
-
-    div[data-testid="stFileUploaderDropzone"] > div {{
-        min-width: 0 !important;
-    }}
-
-    div[data-testid="stFileUploaderDropzone"] p {{
-        font-size: 1.05rem !important;
-        font-weight: 700 !important;
-        line-height: 1.42 !important;
-        margin: 0 !important;
-        overflow-wrap: anywhere !important;
-    }}
-
-    [data-testid="stExpander"] {{
-        background: var(--card-bg) !important;
-        border: 1px solid var(--line-soft) !important;
-        border-radius: 18px !important;
-        overflow: hidden !important;
-        margin: 0.78rem 0 1.05rem !important;
-    }}
-
-    [data-testid="stExpander"] summary {{
-        padding: 0.82rem 0.95rem !important;
-    }}
-
-    .stDataFrame,
-    div[data-testid="stExpander"],
-    [data-testid="stAlert"] {{
-        border-radius: 16px !important;
-    }}
-
-    .stDataFrame,
-    [data-testid="stAlert"] {{
-        margin: 0.55rem 0 0.95rem !important;
-    }}
-
-    .footer {{
-        background: transparent !important;
-        border-top: 1px solid var(--line-soft) !important;
-        margin-top: 1.5rem !important;
-        padding-top: 1rem !important;
-    }}
-
-    @media (max-width: 768px) {{
-        [data-testid="stMainBlockContainer"] {{
-            padding-left: 0.95rem !important;
-            padding-right: 0.95rem !important;
-            padding-top: 0.86rem !important;
-            padding-bottom: 1.45rem !important;
-        }}
-
-        section[data-testid="stSidebar"][aria-expanded="true"] {{
-            min-width: 232px !important;
-            max-width: 232px !important;
-        }}
-
-        [data-testid="stSidebar"] .block-container {{
-            padding: 0.72rem 0.62rem 0.82rem !important;
-        }}
-
-        .page-topbar {{
-            margin-bottom: 0.7rem !important;
-        }}
-
-        .stTabs [role="tablist"] {{
-            gap: 0.45rem !important;
-            margin-bottom: 0.72rem !important;
-        }}
-
-        .kpi-card {{
-            min-height: 116px !important;
-            padding: 0.92rem !important;
-        }}
-
-        .smart-insight-card {{
-            min-height: 142px !important;
-        }}
-
-        .panel {{
-            padding: 0.78rem 0.92rem !important;
-            margin: 0.82rem 0 0.66rem !important;
-        }}
-
-        .view-gap {{
-            height: 0.5rem !important;
-        }}
-
-        .stack-gap {{
-            height: 0.82rem !important;
-        }}
-
-        .insight-row-gap,
-        .upload-preview-card-gap {{
-            height: 0.82rem !important;
-        }}
-
-        div[data-testid="stForm"] {{
-            padding: 0.88rem 0.92rem !important;
-        }}
-
-        div[data-testid="stVerticalBlockBorderWrapper"] {{
-            padding: 0.82rem !important;
-        }}
-
-        .upload-section-heading {{
-            margin-bottom: 0.95rem !important;
-        }}
-
-        .upload-section-heading h2 {{
-            font-size: 1.42rem !important;
-        }}
-
-        .upload-section-heading p {{
-            font-size: 0.88rem !important;
-        }}
-
-        .upload-panel-heading {{
-            gap: 0.62rem !important;
-        }}
-
-        .upload-panel-heading.compact {{
-            margin-bottom: 0.92rem !important;
-        }}
-
-        .upload-panel-step {{
-            font-size: 0.62rem !important;
-            min-height: 1.48rem !important;
-            padding: 0.42rem 0.55rem !important;
-        }}
-
-        .upload-panel-title {{
-            font-size: 1rem !important;
-        }}
-
-        .upload-subsection-label {{
-            margin-top: 0.86rem !important;
-        }}
-
-        div[data-testid="stFileUploaderDropzone"] {{
-            min-height: 9rem !important;
-            padding: 1rem !important;
-        }}
-    }}
-
-    @media (max-width: 480px) {{
-        [data-testid="stMainBlockContainer"] {{
-            padding-left: 0.72rem !important;
-            padding-right: 0.72rem !important;
-            padding-top: 0.78rem !important;
-        }}
-
-        section[data-testid="stSidebar"][aria-expanded="true"] {{
-            min-width: 236px !important;
-            max-width: 236px !important;
-        }}
-
-        [data-testid="stSidebar"] .block-container {{
-            padding: 0.74rem 0.62rem 0.85rem !important;
-        }}
-
-        .page-topbar-title {{
-            white-space: normal;
-            line-height: 1.05;
-        }}
-
-        .view-gap {{
-            height: 0.42rem !important;
-        }}
-
-        div[data-testid="stVerticalBlockBorderWrapper"] {{
-            padding: 0.68rem !important;
-        }}
-
-        .upload-panel-heading {{
-            display: grid !important;
-            gap: 0.52rem !important;
-        }}
-
-        .upload-panel-step {{
-            justify-self: start !important;
-        }}
-
-        .upload-panel-heading.compact {{
-            margin-bottom: 0.78rem !important;
-        }}
-
-        .upload-subsection-label::after {{
-            margin-left: 0.5rem !important;
-        }}
-
-        div[data-testid="stFileUploaderDropzone"] {{
-            min-height: 8rem !important;
-        }}
-    }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def apply_theme_attribute(is_dark: bool) -> None:
+    """Stamp data-theme on the document root so the stylesheet can switch themes.
+
+    Streamlit exposes the configured theme to Python but not to CSS, and it
+    strips <script> from st.markdown. st.html renders inline and can run a
+    script, so the attribute lands on the real document root.
+    """
+    theme_name = "dark" if is_dark else "light"
+    st.html(
+        f'<script>document.documentElement.setAttribute("data-theme", "{theme_name}");</script>',
+        unsafe_allow_javascript=True,
+    )
+
+
+apply_theme_attribute(IS_DARK_THEME)
 
 if not st.session_state.get("app_settings", DEFAULT_SETTINGS).get("enable_animations", True):
+    # Opt-out for the "enable animations" setting. The stylesheet also honours
+    # prefers-reduced-motion on its own, for users who ask the OS instead.
     st.markdown(
         """
         <style>
-        .kpi-card, .panel, .donut-wrap, .legend-chip { animation: none !important; opacity: 1 !important; transform: none !important; }
-        .semi-fill, .donut-center { transition: none !important; }
+        .kpi-card, .legend-chip {
+            animation: none !important;
+            opacity: 1 !important;
+            transform: none !important;
+        }
+        .gauge-seg {
+            animation: none !important;
+            stroke-dasharray: var(--len) 100 !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1518,35 +304,48 @@ if not st.session_state.get("app_settings", DEFAULT_SETTINGS).get("enable_animat
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
+def parse_csv_bytes(data: bytes) -> pd.DataFrame | None:
+    """Parse CSV bytes, detecting encoding and delimiter. Returns None if unreadable."""
+    sample_bytes = data[:4096]
+    detected_encoding = "utf-8"
+    sample = ""
+    for enc in ["utf-8", "utf-8-sig", "latin1"]:
+        try:
+            sample = sample_bytes.decode(enc)
+            detected_encoding = enc
+            break
+        except UnicodeDecodeError:
+            # A multi-byte character cut off at the 4096-byte boundary also lands here;
+            # latin1 accepts any byte, so the loop always ends with a usable sample.
+            continue
+
+    try:
+        sep = csv.Sniffer().sniff(sample, delimiters=",;	|").delimiter
+    except csv.Error:
+        sep = ","
+
+    try:
+        return pd.read_csv(io.BytesIO(data), encoding=detected_encoding, sep=sep)
+    except ParserError:
+        fallback_sep = ";" if sep != ";" else ","
+        try:
+            return pd.read_csv(io.BytesIO(data), encoding=detected_encoding, sep=fallback_sep)
+        except (ParserError, UnicodeDecodeError, ValueError):
+            return None
+    except (UnicodeDecodeError, ValueError):
+        # EmptyDataError is a ValueError subclass: a zero-byte or header-less file.
+        return None
+
+
 @st.cache_data(show_spinner=False)
 def load_csv(path: str) -> pd.DataFrame | None:
     file_path = Path(path)
     if not file_path.exists():
         return None
-
-    sample_encodings = ["utf-8", "utf-8-sig", "latin1"]
-    sample = ""
-    detected_encoding = "utf-8"
-    for enc in sample_encodings:
-        try:
-            with file_path.open("r", encoding=enc, newline="") as sample_file:
-                sample = sample_file.read(4096)
-            detected_encoding = enc
-            break
-        except UnicodeDecodeError:
-            continue
-
     try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-        sep = dialect.delimiter
-    except csv.Error:
-        sep = ","
-
-    try:
-        return pd.read_csv(file_path, encoding=detected_encoding, sep=sep)
-    except ParserError:
-        fallback_sep = ";" if sep != ";" else ","
-        return pd.read_csv(file_path, encoding=detected_encoding, sep=fallback_sep)
+        return parse_csv_bytes(file_path.read_bytes())
+    except OSError:
+        return None
 
 
 @st.cache_data(show_spinner=False)
@@ -1712,17 +511,97 @@ def save_uploaded_csv(uploaded_file: Any, destination_path: str) -> tuple[bool, 
     if parsed.empty:
         return False, f"Saved file at `{target}`, but it has no rows."
 
-    # Clear old CSV data across the data folder after a successful upload
-    data_root = Path("data")
-    if data_root.exists():
-        for old_csv in data_root.rglob("*.csv"):
-            try:
-                if old_csv.resolve() != target.resolve():
-                    old_csv.unlink()
-            except OSError:
-                pass
-
+    # Deliberately no cleanup pass here. This used to delete every other *.csv under
+    # data/ after a successful upload, which took the committed demo dataset and the
+    # pipeline outputs (clean_data.csv, predictions.csv, target.csv) with it. Each
+    # pipeline step already overwrites the file it owns, so stale CSVs are not a problem
+    # worth destroying data to solve.
     return True, f"Saved `{target}` ({parsed.shape[0]} rows, {parsed.shape[1]} columns)."
+
+
+# -----------------------------------------------------------------------------
+# Per-visitor uploads
+# -----------------------------------------------------------------------------
+# An uploaded CSV is parsed straight into st.session_state and never written to disk.
+# Session state belongs to one browser session, so on a shared deployment each visitor
+# explores their own file, nobody else can see it, and it is gone when the tab closes.
+UPLOAD_SESSION_KEY = "uploaded_dataset"
+MAX_UPLOAD_ROWS = 250_000
+_FILTER_STATE_KEYS = (
+    "global_district_filter",
+    "global_crop_filter",
+    "global_district_filter_choice",
+    "global_crop_filter_choice",
+)
+
+
+def session_upload() -> dict[str, Any] | None:
+    upload = st.session_state.get(UPLOAD_SESSION_KEY)
+    return upload if isinstance(upload, dict) else None
+
+
+def _reset_filter_state() -> None:
+    # Filter selections from one dataset rarely exist in the next.
+    for key in _FILTER_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def ingest_session_upload(uploaded_file: Any) -> str | None:
+    """Parse an uploaded CSV into this session. Returns an error message, or None."""
+    upload_id = getattr(uploaded_file, "file_id", None) or f"{uploaded_file.name}:{uploaded_file.size}"
+    current = session_upload()
+    if current and current.get("upload_id") == upload_id:
+        return None
+
+    raw = parse_csv_bytes(uploaded_file.getvalue())
+    if raw is None:
+        return f"`{uploaded_file.name}` could not be read as a CSV file."
+    if raw.empty or raw.shape[1] == 0:
+        return f"`{uploaded_file.name}` has no data rows."
+    if len(raw) > MAX_UPLOAD_ROWS:
+        return (
+            f"`{uploaded_file.name}` has {len(raw):,} rows; this demo explores files of up to "
+            f"{MAX_UPLOAD_ROWS:,} rows. Run the app locally for larger datasets."
+        )
+
+    # Same column-name normalisation the pipeline's clean step applies, so the dashboard
+    # sees an upload the way it sees the pipeline output. Duplicates get a suffix.
+    seen: dict[str, int] = {}
+    columns: list[str] = []
+    for column in raw.columns:
+        base = normalize_column_name(str(column))
+        seen[base] = seen.get(base, -1) + 1
+        columns.append(base if seen[base] == 0 else f"{base}_{seen[base]}")
+
+    st.session_state[UPLOAD_SESSION_KEY] = {
+        "upload_id": upload_id,
+        "name": uploaded_file.name,
+        "raw": raw,
+        "frame": raw.set_axis(columns, axis=1),
+    }
+    _reset_filter_state()
+    return None
+
+
+def upload_widget_key() -> str:
+    return f"dataset_upload_{st.session_state.get('upload_widget_nonce', 0)}"
+
+
+def clear_session_upload() -> None:
+    st.session_state.pop(UPLOAD_SESSION_KEY, None)
+    # A file_uploader cannot be emptied programmatically, and one still holding the file
+    # would re-ingest it on the next run. A fresh key renders a fresh, empty widget.
+    st.session_state["upload_widget_nonce"] = st.session_state.get("upload_widget_nonce", 0) + 1
+    _reset_filter_state()
+
+
+def upload_privacy_note(upload: dict[str, Any]) -> str:
+    frame = upload["frame"]
+    return (
+        f"Exploring your upload **{upload['name']}** "
+        f"({frame.shape[0]:,} rows, {frame.shape[1]} columns). It lives only in this browser "
+        "session: it is not saved on the server and no other visitor can see it."
+    )
 
 
 def run_pipeline_for_input(input_path: str, target_column: str, settings: dict[str, Any]) -> tuple[bool, str]:
@@ -1879,8 +758,10 @@ def pick_geography_column(df: pd.DataFrame) -> str | None:
 
 
 def pretty_column_label(name: str) -> str:
-    clean = re.sub(r"_+", " ", str(name)).strip()
-    return clean.title() if clean else "Field"
+    """Readable, sentence-case label with the unit pulled out: ``yield_kg_per_ha`` -> ``Yield (kg/ha)``."""
+    if not str(name).strip("_ "):
+        return "Field"
+    return axis_title(str(name))
 
 
 def numeric_valid_ratio(df: pd.DataFrame, column: str) -> float:
@@ -1998,6 +879,7 @@ def infer_target_column(df: pd.DataFrame | None) -> str | None:
         return None
 
     priority = [
+        "yield_kg_per_ha",
         "yield_tons",
         "yield",
         "yield_kg",
@@ -2062,30 +944,6 @@ def format_num(value: object, digits: int = 1) -> str:
     return f"{numeric_value:.{digits}f}"
 
 
-def style_chart_axes(ax: plt.Axes, dark: bool = True) -> None:
-    if dark:
-        bg = "#0f1720"
-        spine_col = "#2f3f48"
-        tick = "#c9d4ce"
-        label = "#dce7e1"
-        grid = "#2f3f48"
-    else:
-        bg = "#f4f8f6"
-        spine_col = "#b9c8be"
-        tick = "#3f4c44"
-        label = "#2f3a34"
-        grid = "#d6e1da"
-
-    ax.set_facecolor(bg)
-    for spine in ax.spines.values():
-        spine.set_color(spine_col)
-        spine.set_linewidth(1.0)
-    ax.tick_params(colors=tick)
-    ax.xaxis.label.set_color(label)
-    ax.yaxis.label.set_color(label)
-    ax.grid(alpha=0.32, color=grid)
-
-
 def sanitize_block(markup: str) -> str:
     return dedent(markup).strip()
 
@@ -2131,19 +989,62 @@ def hex_to_rgba(color_value: str | None, alpha: float = 0.14) -> str | None:
     return f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {alpha})"
 
 
+_CHIP_OK = {"available", "ready", "ok", "passed", "complete", "enabled", "on", "yes"}
+_CHIP_BAD = {"missing", "failed", "error", "none", "unavailable", "no"}
+_CHIP_WARN = {"stale", "partial", "pending", "unknown", "never"}
+
+
+def chip_tone(value: object) -> str:
+    """Map a chip value to a status class so state reads at a glance."""
+    text = str(value).strip().lower()
+    if text in _CHIP_OK:
+        return "is-ok"
+    if text in _CHIP_BAD:
+        return "is-danger"
+    if text in _CHIP_WARN:
+        return "is-warn"
+    return ""
+
+
 def render_page_header(
     title: str,
     subtitle: str = "",
     chips: list[tuple[str, str]] | None = None,
     eyebrow: str = "",
 ) -> None:
-    header_html = (
+    """Render a page header.
+
+    Every argument is rendered. Callers pass status chips carrying real state
+    (dataset availability, last pipeline run), so dropping them silently would
+    hide information the page has already computed.
+    """
+    parts: list[str] = []
+
+    if eyebrow:
+        parts.append(f'<div class="page-header-eyebrow">{html.escape(eyebrow)}</div>')
+
+    parts.append(
         '<div class="page-topbar">'
         f'<h1 class="page-topbar-title">{html.escape(title)}</h1>'
         '<div class="page-topbar-rule"></div>'
         '</div>'
     )
-    st.markdown(header_html, unsafe_allow_html=True)
+
+    if subtitle:
+        parts.append(f'<p class="page-header-subtitle">{html.escape(subtitle)}</p>')
+
+    if chips:
+        chip_html = "".join(
+            f'<span class="page-chip {chip_tone(value)}">'
+            f'<span class="page-chip-label">{html.escape(str(label))}</span>'
+            f'<span class="page-chip-value">{html.escape(str(value))}</span>'
+            '</span>'
+            for label, value in chips
+        )
+        parts.append(f'<div class="page-chips">{chip_html}</div>')
+
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
 
 def insight_card_html(
     title: str,
@@ -2165,29 +1066,25 @@ def insight_card_html(
     )
 
 
-def render_insight_cards(insights: list[dict[str, str]], per_row: int = 2, gap: str = "small") -> None:
+def render_insight_cards(insights: list[dict[str, str]], per_row: int = 2) -> None:
+    """Lay the cards out in one CSS grid, so cards in a row share a height and stack on phones."""
     cleaned = [item for item in insights if item]
     if not cleaned:
         return
-
-    width = max(1, min(per_row, 2 if len(cleaned) >= 4 else per_row))
-    for start in range(0, len(cleaned), width):
-        row = cleaned[start : start + width]
-        columns = st.columns(len(row), gap=gap)
-        for col, item in zip(columns, row):
-            with col:
-                st.markdown(
-                    insight_card_html(
-                        title=item.get("title", ""),
-                        body=item.get("body", ""),
-                        kicker=item.get("kicker", ""),
-                        tone=item.get("tone", "neutral"),
-                        footnote=item.get("footnote", ""),
-                    ),
-                    unsafe_allow_html=True,
-                )
-        if start + width < len(cleaned):
-            st.markdown('<div class="insight-row-gap"></div>', unsafe_allow_html=True)
+    cards = "".join(
+        insight_card_html(
+            title=item.get("title", ""),
+            body=item.get("body", ""),
+            kicker=item.get("kicker", ""),
+            tone=item.get("tone", "neutral"),
+            footnote=item.get("footnote", ""),
+        )
+        for item in cleaned
+    )
+    st.markdown(
+        f'<div class="insight-grid" style="--cols:{max(1, per_row)};">{cards}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def datetime_valid_ratio(df: pd.DataFrame, column: str) -> float:
@@ -2730,35 +1627,6 @@ def build_dashboard_insights(
     return deduped[:4]
 
 
-def compose_dashboard_brief(
-    df: pd.DataFrame,
-    metric_col: str | None,
-    date_col: str | None = None,
-    comparison_col: str | None = None,
-) -> str:
-    if df is None or df.empty:
-        return "Once a dataset is available, AgroSynapse will automatically infer its strongest metrics, comparison axes, and data risks."
-
-    completeness = float(df.notna().sum().sum()) / float(max(df.shape[0] * max(df.shape[1], 1), 1)) * 100.0
-    parts: list[str] = [f"AgroSynapse is reading {len(df):,} visible records in this slice."]
-    if metric_col:
-        metric_series = pd.to_numeric(df[metric_col], errors="coerce").dropna()
-        if not metric_series.empty:
-            parts.append(
-                f"It is treating {pretty_column_label(metric_col)} as the lead measure, with a current average of {format_num(metric_series.mean(), 2)}."
-            )
-    if comparison_col:
-        parts.append(f"{pretty_column_label(comparison_col)} is the strongest comparison axis in the current view.")
-    if date_col:
-        parts.append(f"{pretty_column_label(date_col)} provides a usable time signal for trend tracking.")
-    if completeness >= 85:
-        parts.append(f"Coverage is strong at {completeness:.1f}%, so the insights below are well-supported.")
-    else:
-        parts.append(f"Coverage is {completeness:.1f}%, so treat the weaker signals as directional rather than definitive.")
-
-    return " ".join(parts)
-
-
 def build_upload_preview_insights(
     df: pd.DataFrame,
     target_candidate: str | None = None,
@@ -2833,6 +1701,9 @@ def app_settings() -> dict[str, Any]:
 
 
 def get_active_frame() -> pd.DataFrame | None:
+    upload = session_upload()
+    if upload is not None:
+        return upload["frame"]
     settings = app_settings()
     clean_df = load_csv(str(settings["clean_data_path"]))
     if clean_df is not None:
@@ -2855,21 +1726,13 @@ def pipeline_artifacts() -> list[tuple[str, Path]]:
     ]
 
 
-def pipeline_status_items() -> list[str]:
-    checks = pipeline_artifacts()
-    items: list[str] = []
-    for label, path in checks:
-        items.append(f"{label}: {'OK' if path.exists() else 'Missing'}")
-    return items
-
-
-def last_run_badge() -> str:
+def last_run_label() -> str:
+    """When the pipeline last wrote an artifact, or "Never"."""
     existing_paths = [path for _, path in pipeline_artifacts() if path.exists()]
     if not existing_paths:
-        return "Last Run: N/A"
+        return "Never"
     latest = max(existing_paths, key=lambda p: p.stat().st_mtime)
-    latest_dt = datetime.fromtimestamp(latest.stat().st_mtime)
-    return f"Last Run: {latest_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+    return datetime.fromtimestamp(latest.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
 
 def data_diff_summary() -> dict[str, object]:
@@ -2920,7 +1783,7 @@ def data_contract_check(df: pd.DataFrame) -> list[dict[str, str]]:
             {
                 "Field": "Records",
                 "Status": "Missing",
-                "Mapped Column": "0 rows",
+                "Mapped column": "0 rows",
                 "Priority": "Required",
             }
         ]
@@ -2930,15 +1793,18 @@ def data_contract_check(df: pd.DataFrame) -> list[dict[str, str]]:
             {
                 "Field": field,
                 "Status": "Found" if found else "Missing",
-                "Mapped Column": mapped if mapped else "-",
+                "Mapped column": mapped if mapped else "-",
                 "Priority": priority,
             }
         )
 
-    add_row("Records", True, f"{len(df)} rows", "Required")
+    add_row("Records", True, f"{len(df):,} rows", "Required")
 
-    target_col = pick_column(df, ["yield_tons", "yield", "yield_kg", "actual_yield_tons", "value", "target"])
-    add_row("Target/Outcome", bool(target_col), target_col or "-", "Required")
+    target_col = pick_column(
+        df,
+        ["yield_kg_per_ha", "yield_t_per_ha", "yield_tons", "yield", "yield_kg", "actual_yield_tons", "value", "target"],
+    )
+    add_row("Target (outcome)", bool(target_col), target_col or "-", "Required")
 
     numeric_col = pick_numeric_column(
         df,
@@ -2948,7 +1814,7 @@ def data_contract_check(df: pd.DataFrame) -> list[dict[str, str]]:
     )
     numeric_ratio = (numeric_valid_ratio(df, numeric_col) * 100.0) if numeric_col else 0.0
     numeric_mapped = f"{numeric_col} ({numeric_ratio:.0f}% numeric)" if numeric_col else "-"
-    add_row("Numeric Measure", bool(numeric_col), numeric_mapped, "Required")
+    add_row("Numeric measure", bool(numeric_col), numeric_mapped, "Required")
 
     category_col = pick_category_column(
         df,
@@ -2957,16 +1823,16 @@ def data_contract_check(df: pd.DataFrame) -> list[dict[str, str]]:
     )
     if category_col:
         distinct = int(df[category_col].dropna().astype(str).nunique())
-        add_row("Category Dimension", True, f"{category_col} ({distinct} classes)", "Required")
+        add_row("Category", True, f"{category_col} ({distinct} classes)", "Required")
     else:
-        add_row("Category Dimension", False, "-", "Required")
+        add_row("Category", False, "-", "Required")
 
-    geo_col = pick_geography_column(df)
-    add_row("District/Region", bool(geo_col), geo_col or "-", "Recommended")
+    geo_col = geography_column(df)
+    add_row("Place (country, region, district)", bool(geo_col), geo_col or "-", "Recommended")
 
     seed_col = pick_column(df, ["improved_seed_used", "improved_seed", "seed_improved"])
     if seed_col:
-        add_row("Seed Adoption", True, seed_col, "Optional")
+        add_row("Seed adoption", True, seed_col, "Optional")
 
     date_candidates: list[tuple[float, str]] = []
     for col in df.columns:
@@ -2983,33 +1849,16 @@ def data_contract_check(df: pd.DataFrame) -> list[dict[str, str]]:
     date_candidates.sort(key=lambda item: item[0], reverse=True)
     if date_candidates:
         ratio, best_date_col = date_candidates[0]
-        add_row("Time Dimension", True, f"{best_date_col} ({ratio * 100:.0f}% parseable)", "Recommended")
+        add_row("Time", True, f"{best_date_col} ({ratio * 100:.0f}% parseable)", "Recommended")
     else:
-        add_row("Time Dimension", False, "-", "Recommended")
+        add_row("Time", False, "-", "Recommended")
 
     total_cells = int(df.shape[0] * max(df.shape[1], 1))
     filled_cells = int(df.notna().sum().sum())
     completeness = (filled_cells / total_cells * 100.0) if total_cells else 0.0
-    add_row("Data Completeness", completeness >= 60.0, f"{completeness:.1f}% non-missing", "Optional")
+    add_row("Completeness", completeness >= 60.0, f"{completeness:.1f}% non-missing", "Optional")
 
     return rows
-
-
-def seed_adoption_donut(df: pd.DataFrame) -> tuple[float, pd.DataFrame, pd.DataFrame]:
-    seed_col = pick_column(df, ["improved_seed_used", "improved_seed", "seed_improved"])
-    if seed_col is None:
-        return 0.0, df, df.iloc[0:0].copy()
-
-    series = df[seed_col].astype(str).str.strip().str.lower()
-    yes_values = {"yes", "true", "1", "y"}
-    no_values = {"no", "false", "0", "n"}
-    valid_mask = series.isin(yes_values | no_values)
-    valid_df = df.loc[valid_mask].copy()
-    valid_series = series.loc[valid_mask]
-    adoption_rate = float(valid_series.isin(yes_values).mean() * 100.0) if len(valid_series) else 0.0
-    adopters_df = valid_df.loc[valid_series.isin(yes_values)].copy()
-
-    return adoption_rate, valid_df, adopters_df
 
 
 def detect_adoption_metrics(df: pd.DataFrame) -> list[tuple[str, str, str]]:
@@ -3018,11 +1867,11 @@ def detect_adoption_metrics(df: pd.DataFrame) -> list[tuple[str, str, str]]:
     Returns list of (column_name, display_label, metric_type) tuples.
     """
     adoption_patterns = [
-        (["improved_seed_used", "improved_seed", "seed_improved"], "Improved Seed"),
-        (["irrigation_used", "irrigation", "uses_irrigation"], "Irrigation Usage"),
-        (["fertilizer_used", "uses_fertilizer", "fertilizer"], "Fertilizer Usage"),
-        (["pesticide_used", "uses_pesticide", "pesticide"], "Pesticide Usage"),
-        (["organic_fertilizer", "uses_organic"], "Organic Inputs"),
+        (["improved_seed_used", "improved_seed", "seed_improved"], "Improved seed"),
+        (["irrigation_used", "irrigation", "uses_irrigation"], "Irrigation"),
+        (["fertilizer_used", "uses_fertilizer", "fertilizer"], "Fertilizer use"),
+        (["pesticide_used", "uses_pesticide", "pesticide"], "Pesticide use"),
+        (["organic_fertilizer", "uses_organic"], "Organic inputs"),
     ]
     
     detected = []
@@ -3062,16 +1911,7 @@ def crop_distribution_legend(df: pd.DataFrame) -> list[dict[str, object]]:
     shares = df[crop_col].astype(str).value_counts(normalize=True)
     if shares.empty:
         return []
-    palette = [
-        "#52d273",
-        "#34c2a6",
-        "#49a9f1",
-        "#8479ff",
-        "#d26cf3",
-        "#f39a58",
-        "#f0627a",
-        "#b6d657",
-    ]
+    palette = CHART_PALETTE
 
     legend_items: list[dict[str, object]] = []
     for idx, (name, share) in enumerate(shares.items()):
@@ -3088,16 +1928,7 @@ def adoption_crop_segments(adoption_rate: float, adopters_df: pd.DataFrame) -> l
     if crop_col is None or adopters_df.empty:
         return [{"crop": "Adoption", "color": "#52d273", "start": 0.0, "length": float(adoption_rate)}]
 
-    palette = [
-        "#52d273",
-        "#34c2a6",
-        "#49a9f1",
-        "#8479ff",
-        "#d26cf3",
-        "#f39a58",
-        "#f0627a",
-        "#b6d657",
-    ]
+    palette = CHART_PALETTE
     shares = adopters_df[crop_col].astype(str).value_counts(normalize=True)
     segments: list[dict[str, float | str]] = []
     start = 0.0
@@ -3118,1034 +1949,955 @@ def adoption_crop_segments(adoption_rate: float, adopters_df: pd.DataFrame) -> l
     return segments
 
 
+def _as_float(value: object) -> float | None:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
 def model_readiness_message(metrics: dict) -> tuple[str, str]:
-    n_train = float(metrics.get("n_train", 0) or 0)
-    mae = metrics.get("mae")
-    rmse = metrics.get("rmse")
-    baseline_metrics = metrics.get("baseline_metrics")
+    """Verdict on the model, judged against baselines rather than fixed error cut-offs.
 
-    if isinstance(baseline_metrics, dict) and baseline_metrics.get("mae") is not None and mae is not None:
-        try:
-            if float(mae) > float(baseline_metrics["mae"]):
-                return (
-                    "Needs more signal",
-                    "The learned model is not beating a simple median baseline yet. Collect more records before relying on predictions.",
-                )
-        except (TypeError, ValueError):
-            pass
+    Error is in the target's own units (kg/ha, t/ha, a price), so an absolute threshold
+    cannot mean the same thing across datasets. The forward-looking check against
+    carrying the previous season forward is the most honest benchmark, so it wins when
+    the metrics include it.
+    """
+    holdout = metrics.get("temporal_holdout") if isinstance(metrics.get("temporal_holdout"), dict) else {}
+    persistence = holdout.get("persistence_metrics") if isinstance(holdout.get("persistence_metrics"), dict) else {}
+    holdout_mae = _as_float(holdout.get("mae"))
+    persistence_mae = _as_float(persistence.get("mae"))
+    if holdout_mae is not None and persistence_mae:
+        if holdout_mae < persistence_mae:
+            gain = 100 * (1 - holdout_mae / persistence_mae)
+            return (
+                "Beats naive forecast",
+                f"On later seasons it never saw, its average error is {gain:.0f}% lower than "
+                "carrying the previous season forward.",
+            )
+        return (
+            "No better than naive",
+            "On later seasons it never saw, it does not beat carrying the previous season forward. "
+            "Treat predictions as a summary of recent history, not a forecast.",
+        )
 
-    if n_train < 100:
+    mae = _as_float(metrics.get("mae"))
+    baseline = metrics.get("baseline_metrics") if isinstance(metrics.get("baseline_metrics"), dict) else {}
+    baseline_mae = _as_float(baseline.get("mae"))
+    if mae is not None and baseline_mae and mae >= baseline_mae:
+        return (
+            "Needs more signal",
+            "The learned model is not beating a simple median baseline yet. Collect more records before relying on predictions.",
+        )
+
+    if float(metrics.get("n_train", 0) or 0) < 100:
         return (
             "Early-stage model",
             "This model is trained on a small sample. Treat predictions as directional guidance, not final decisions.",
         )
 
-    if mae is not None and rmse is not None:
-        try:
-            mae_v = float(mae)
-            rmse_v = float(rmse)
-            if mae_v <= 2.5 and rmse_v <= 3.5:
-                return ("Strong model", "Prediction error is relatively low for this dataset.")
-            if mae_v <= 5.0 and rmse_v <= 7.0:
-                return ("Improving model", "Useful for planning, but continue collecting data to improve reliability.")
-        except (TypeError, ValueError):
-            pass
+    if mae is not None and baseline_mae:
+        gain = 100 * (1 - mae / baseline_mae)
+        return (
+            "Beats median baseline",
+            f"Average error is {gain:.0f}% lower than always predicting the median. There is no "
+            "time-based check for this dataset, so treat that figure as optimistic.",
+        )
 
     return ("Experimental model", "Model quality is still evolving. Use alongside field judgment.")
 
 
+def format_year(value: object) -> str:
+    number = _as_float(value)
+    return str(int(number)) if number is not None else "?"
+
+
+def render_forward_looking_evaluation(metrics: dict) -> None:
+    """Show how the model scores on seasons it never saw, against realistic baselines.
+
+    The headline metrics come from a random train/test split, which is optimistic on a
+    country/crop/year panel: 2019 and 2020 rows for the same series land on opposite sides
+    of the split. This section reports the split that matches how the model would be used
+    - trained on past seasons, scored on later ones - and compares it against carrying the
+    previous season's value forward, which is the benchmark a practitioner would apply.
+    """
+    holdout = metrics.get("temporal_holdout")
+    if not isinstance(holdout, dict):
+        return
+
+    train_from, train_to = holdout.get("train_periods", [None, None])
+    test_from, test_to = holdout.get("test_periods", [None, None])
+    with st.container(border=True):
+        st.markdown("**Forward-looking check**")
+        st.caption(
+            f"Trained on {format_year(train_from)}-{format_year(train_to)}, scored on "
+            f"{format_year(test_from)}-{format_year(test_to)} "
+            f"({format_num(holdout.get('n_test'), 0)} records it never saw), against the naive "
+            "forecasts a practitioner would otherwise use."
+        )
+
+        rows = [
+            {
+                "Approach": f"{model_display_label(holdout.get('model_type'))} (this model)",
+                "MAE": holdout.get("mae"),
+                "RMSE": holdout.get("rmse"),
+                "R2": holdout.get("r2"),
+            }
+        ]
+        persistence = holdout.get("persistence_metrics")
+        if isinstance(persistence, dict):
+            rows.append(
+                {
+                    "Approach": "Carry previous season forward",
+                    "MAE": persistence.get("mae"),
+                    "RMSE": persistence.get("rmse"),
+                    "R2": persistence.get("r2"),
+                }
+            )
+        baseline = holdout.get("baseline_metrics")
+        if isinstance(baseline, dict):
+            rows.append(
+                {
+                    "Approach": "Median of training data",
+                    "MAE": baseline.get("mae"),
+                    "RMSE": baseline.get("rmse"),
+                    "R2": baseline.get("r2"),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "MAE": st.column_config.NumberColumn(format="%.1f"),
+                "RMSE": st.column_config.NumberColumn(format="%.1f"),
+                "R2": st.column_config.NumberColumn("R²", format="%.3f"),
+            },
+        )
+
+
 def model_display_label(model_type: object) -> str:
     labels = {
-        "random_forest": "Random Forest",
-        "extra_trees": "Extra Trees",
+        "random_forest": "Random forest",
+        "extra_trees": "Extra trees",
     }
     return labels.get(str(model_type), pretty_column_label(str(model_type))) if model_type else "Model"
 
 
 # -----------------------------------------------------------------------------
-# Sidebar
+# Analysis page helpers (Crop Insights, Data Quality)
 # -----------------------------------------------------------------------------
-NAV_PAGES = ["Dashboard", "Overview", "Model Performance", "Data Explorer", "Uploads", "Settings"]
-if "active_page" not in st.session_state:
-    st.session_state["active_page"] = "Dashboard"
+# Categorical slots for multi-series charts, validated (lightness band, CVD and
+# normal-vision separation, contrast) against this app's own chart surfaces.
+SERIES_PALETTE_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#9085e9"]
+SERIES_PALETTE_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
+SERIES_PALETTE = SERIES_PALETTE_DARK if IS_DARK_THEME else SERIES_PALETTE_LIGHT
+AXIS_INK = THEME["muted"]
+ANALYSIS_MAX_SERIES = len(SERIES_PALETTE)
+SEVERITY_LABELS = {"high": "High", "medium": "Medium", "low": "Low"}
 
-if st.session_state["active_page"] not in NAV_PAGES:
-    st.session_state["active_page"] = "Dashboard"
 
-render_sidebar_brand()
-st.sidebar.markdown('<div class="sidebar-nav-title"></div>', unsafe_allow_html=True)
-page = st.sidebar.radio(
-    "Navigation",
-    NAV_PAGES,
-    key="active_page",
-    label_visibility="collapsed",
-)
+def geography_column(df: pd.DataFrame) -> str | None:
+    """Place column for peer comparisons: country first, then sub-national units."""
+    return pick_column(
+        df,
+        ["country", "country_name", "area", "state", "state_region", "region", "district", "district_lga", "lga"],
+    ) or pick_geography_column(df)
 
-active_df = get_active_frame()
+
+def category_columns(df: pd.DataFrame, max_unique: int = 100) -> list[str]:
+    """Text columns worth grouping by: 2..max_unique values, no personal data."""
+    out: list[str] = []
+    for col in df.columns:
+        name = str(col)
+        if is_risky_column(name) or pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        unique = int(df[col].dropna().astype(str).str.strip().nunique())
+        if 2 <= unique <= max_unique:
+            out.append(name)
+    return out
+
+
+def time_columns(df: pd.DataFrame) -> list[str]:
+    out: list[str] = []
+    for col in df.columns:
+        norm = normalize_column_name(str(col))
+        if not any(tok in norm for tok in ["year", "date", "season", "time", "period"]):
+            continue
+        if any(tok in norm for tok in ["yield", "prev", "kg", "ha"]):
+            continue
+        if period_values(df[col]).notna().mean() >= 0.5:
+            out.append(str(col))
+    return out
+
+
+def option_index(options: list[Any], value: Any, fallback: int = 0) -> int:
+    return options.index(value) if value in options else fallback
+
+
+def axis_title(column: str) -> str:
+    unit = measure_unit(column)
+    return f"{measure_label(column)} ({unit})" if unit else measure_label(column)
+
+
+@st.cache_data(show_spinner="Checking data quality...", max_entries=8)
+def cached_quality_report(df: pd.DataFrame, key_columns: tuple[str, ...], group_column: str | None) -> dict[str, Any]:
+    return quality_report(df, key_columns=list(key_columns), group_column=group_column)
+
+
+@st.cache_data(show_spinner="Summarising...", max_entries=16)
+def cached_summary(
+    df: pd.DataFrame,
+    value_col: str,
+    group_col: str | None,
+    time_col: str | None,
+    geo_col: str | None,
+    focus: str | None,
+    quality: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    return write_summary(df, value_col, group_col, time_col, geo_col, focus, quality)
+
+
+def default_quality_keys(df: pd.DataFrame) -> list[str]:
+    geo = geography_column(df)
+    group = pick_column(df, ["crop", "crop_type", "main_crop"])
+    times = time_columns(df)
+    keys = [c for c in [geo, group, times[0] if times else None] if c]
+    return keys if len(keys) == 3 else []
+
+
+def quality_group_default(df: pd.DataFrame) -> str | None:
+    return pick_column(df, ["crop", "crop_type", "main_crop", "commodity", "item"])
+
+
+# -----------------------------------------------------------------------------
+# Shared page chrome
+# -----------------------------------------------------------------------------
+# Inline SVG icons for the KPI cards. Material Symbols cannot be placed inside the
+# custom card markup, so the cards carry their own small icon set.
+KPI_ICONS: dict[str, str] = {
+    "records": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 17h2v4H3zm4-6h2v10H7zm4-4h2v14h-2zm4-8h2v18h-2zm4 12h2v6h-2z"/></svg>',
+    "average": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l4-4 4 4 8-8"/><path d="M4 20h16"/></svg>',
+    "place": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a7 7 0 0 0-7 7c0 5.25 7 13 7 13s7-7.75 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 14.5 9 2.5 2.5 0 0 1 12 11.5z"/></svg>',
+    "category": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M5 4h14v3H5zm0 6h14v3H5zm0 6h14v3H5z"/></svg>',
+    "complete": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm-1 14.5l-3.5-3.5 1.41-1.41L11 13.67l5.59-5.59L18 9.5 11 16.5z"/></svg>',
+    "error": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 3a9 9 0 1 0 9 9 9 9 0 0 0-9-9zm1 13h-2v-2h2zm0-4h-2V7h2z"/></svg>',
+    "spike": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M13 2 3 14h7l-1 8 10-12h-7z"/></svg>',
+    "people": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M16 11a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm8 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4zm-8 1c-2.33 0-7 1.17-7 3.5V19h7v-1.5A4.68 4.68 0 0 1 10 14.6 8.55 8.55 0 0 0 8 14z"/></svg>',
+    "list": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 4h16v2H4zm0 5h16v2H4zm0 5h10v2H4zm0 5h10v2H4z"/></svg>',
+    "split": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M5 3h14a2 2 0 0 1 2 2v14l-4-3-4 3-4-3-4 3V5a2 2 0 0 1 2-2z"/></svg>',
+    "target": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 14a4 4 0 1 1 4-4 4 4 0 0 1-4 4zm0-6a2 2 0 1 0 2 2 2 2 0 0 0-2-2z"/></svg>',
+    "model": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 4h16v4H4zm0 6h7v10H4zm9 0h7v10h-7z"/></svg>',
+    "baseline": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 11h18v2H3zm4-6h10v2H7zm0 12h10v2H7z"/></svg>',
+    "features": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 5h16v2H4zm0 6h16v2H4zm0 6h10v2H4z"/></svg>',
+    "shield": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2 3 7v6c0 5 3.8 9.74 9 11 5.2-1.26 9-6 9-11V7zm0 2.18 7 3.11V13c0 4.07-2.83 7.92-7 9.06C7.83 20.92 5 17.07 5 13V7.29z"/></svg>',
+    "signals": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M11 2v20a9 9 0 1 1 0-20zm2 0a9 9 0 0 1 0 20z"/></svg>',
+    "check": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M10 17 5 12l1.41-1.41L10 14.17l7.59-7.59L19 8z"/></svg>',
+    "alert": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M1 21h22L12 2zm12-3h-2v-2h2zm0-4h-2v-4h2z"/></svg>',
+}
+
+BRAND_SERIES = "#52d273"
+GAUGE_ARC = "M 20 130 A 104 104 0 0 1 228 130"
+
 district_filter_key = "global_district_filter"
 crop_filter_key = "global_crop_filter"
 district_filter_choice_key = "global_district_filter_choice"
 crop_filter_choice_key = "global_crop_filter_choice"
-dashboard_filters_open_key = "dashboard_filters_open"
-secondary_filter_label = "Crop"
-secondary_filter_col: str | None = None
 
-if dashboard_filters_open_key not in st.session_state:
-    st.session_state[dashboard_filters_open_key] = False
+active_df = get_active_frame()
+
+
+def lower_first(text: str) -> str:
+    """Lower-case the first letter only, so units such as "US$" survive mid-sentence."""
+    return text[:1].lower() + text[1:] if text else text
+
+
+def plural_label(label: str) -> str:
+    if label.endswith("y") and not label.endswith(("ay", "ey", "oy")):
+        return label[:-1] + "ies"
+    return label if label.endswith("s") else label + "s"
 
 
 def reset_global_filters() -> None:
-    st.session_state[district_filter_key] = "All"
-    st.session_state[crop_filter_key] = "All"
-    st.session_state[district_filter_choice_key] = "All"
-    st.session_state[crop_filter_choice_key] = "All"
+    for key in (district_filter_key, crop_filter_key, district_filter_choice_key, crop_filter_choice_key):
+        st.session_state[key] = "All"
 
 
-def toggle_dashboard_filters() -> None:
-    st.session_state[dashboard_filters_open_key] = not st.session_state[dashboard_filters_open_key]
+def gauge_html(rate: float, label: str, segments: list[dict[str, float | str]]) -> str:
+    """Half-ring gauge. Segments fill in with a CSS animation, so no script is needed."""
+    segment_paths = "".join(
+        f'<path class="gauge-seg" d="{GAUGE_ARC}" pathLength="100" stroke="{seg["color"]}" '
+        f'stroke-dashoffset="-{float(seg["start"]):.4f}" '
+        f'style="--len:{float(seg["length"]):.4f};--delay:{int(float(seg["start"]) * 8)}ms"></path>'
+        for seg in segments
+    )
+    safe_label = html.escape(label)
+    return (
+        f'<figure class="gauge" role="img" aria-label="{safe_label}: {rate:.1f}%">'
+        '<svg class="gauge-svg" viewBox="0 0 248 140" aria-hidden="true">'
+        f'<path class="gauge-track" d="{GAUGE_ARC}" pathLength="100"></path>{segment_paths}'
+        "</svg>"
+        f'<figcaption class="gauge-center"><span class="gauge-value">{rate:.1f}%</span>'
+        f'<span class="gauge-label">{safe_label}</span></figcaption>'
+        "</figure>"
+    )
 
-# Global Filters moved to Dashboard top bar
 
-st.sidebar.markdown('<div class="sidebar-nav-title"></div>', unsafe_allow_html=True)
-with st.sidebar.expander("Pipeline Status", expanded=False):
-    for item in pipeline_status_items():
-        st.write(f"- {item}")
-    st.caption(last_run_badge())
+def legend_chips_html(entries: list[dict[str, object]]) -> str:
+    chips = "".join(
+        f'<span class="legend-chip"><span class="legend-dot" style="--dot:{entry["color"]};"></span>'
+        f'{html.escape(str(entry["crop"]))} {float(entry["share_pct"]):.0f}%</span>'
+        for entry in entries
+    )
+    return f'<div class="crop-legend">{chips}</div>'
 
 
-# -----------------------------------------------------------------------------
-# Header
-# -----------------------------------------------------------------------------
+def ranked_bar_chart(frame: pd.DataFrame, category_title: str, value_title: str, value_format: str) -> alt.Chart:
+    """Horizontal bars, largest first. ``frame`` has ``category`` and ``value`` columns."""
+    return (
+        alt.Chart(frame)
+        .mark_bar(cornerRadiusEnd=4, color=BRAND_SERIES, height={"band": 0.72})
+        .encode(
+            y=alt.Y("category:N", sort="-x", title=None, axis=alt.Axis(labelLimit=200, labelOverlap=False)),
+            x=alt.X("value:Q", title=value_title),
+            tooltip=[
+                alt.Tooltip("category:N", title=category_title),
+                alt.Tooltip("value:Q", title=value_title, format=value_format),
+            ],
+        )
+        .properties(height=max(140, 28 * len(frame)))
+        .configure_view(stroke=None)
+        .configure_axis(gridOpacity=0.18, labelColor=AXIS_INK, titleColor=AXIS_INK)
+    )
+
+
+def render_sidebar() -> None:
+    upload = session_upload()
+    if upload is not None:
+        with st.sidebar.container(border=True):
+            st.markdown(f":material/lock: **Your upload**  \n`{upload['name']}`")
+            st.caption("Private to this browser session and never saved.")
+            if st.button("Back to demo data", key="sidebar_clear_upload", icon=":material/undo:", width="stretch"):
+                clear_session_upload()
+                st.rerun()
+
+    with st.sidebar.expander("Pipeline status", icon=":material/monitor_heart:"):
+        for label, path in pipeline_artifacts():
+            if path.exists():
+                st.markdown(f":green[:material/check_circle:] {label}")
+            else:
+                st.markdown(f":red[:material/cancel:] {label} (missing)")
+        st.caption(f"Last run: {last_run_label()}")
+
+    render_admin_unlock()
 
 
 # -----------------------------------------------------------------------------
 # Page: Dashboard
 # -----------------------------------------------------------------------------
-if page == "Dashboard":
+def page_dashboard() -> None:
     settings = app_settings()
-    dashboard_header_chips: list[tuple[str, str]] = [
-        ("Pipeline", last_run_badge().replace("Last Run: ", "")),
-    ]
-    if active_df is not None and not active_df.empty:
-        dashboard_header_chips.insert(0, ("Records", format_num(len(active_df), 0)))
-        dashboard_header_chips.insert(1, ("Fields", format_num(active_df.shape[1], 0)))
+    upload = session_upload()
+    has_data = active_df is not None and not active_df.empty
+
+    chips: list[tuple[str, str]] = []
+    if has_data:
+        chips += [("Records", format_num(len(active_df), 0)), ("Fields", format_num(active_df.shape[1], 0))]
+    else:
+        chips.append(("Dataset", "Missing"))
+    chips.append(("Source", "Your upload") if upload is not None else ("Pipeline run", last_run_label()))
+    if has_data:
         detected_target = infer_target_column(active_df)
         if detected_target:
-            dashboard_header_chips.append(("Target candidate", pretty_column_label(detected_target)))
-    else:
-        dashboard_header_chips.insert(0, ("Dataset", "Awaiting upload"))
+            chips.append(("Target", pretty_column_label(detected_target)))
 
     render_page_header(
         "Dashboard",
-        "A live operational view of your latest agricultural dataset with automatic pattern detection, benchmark gaps, and decision-focused data summaries.",
-        chips=dashboard_header_chips,
-        eyebrow="Operational intelligence",
+        "Headline figures for the active dataset, the patterns AgroSynapse detects in it, "
+        "and how its main measure is distributed.",
+        chips=chips,
+        eyebrow="At a glance",
     )
     st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
+    if upload is not None:
+        st.info(upload_privacy_note(upload), icon=":material/lock:")
 
-    # Global Filter Bar
-    if active_df is not None:
-        district_col = pick_geography_column(active_df)
-        crop_col = pick_column(active_df, ["crop", "crop_type", "main_crop"])
-        secondary_filter_col = crop_col or pick_category_column(
-            active_df,
-            exclude=[district_col] if district_col else [],
-            preferred_tokens=["crop", "type", "category", "indicator", "soil", "state", "region", "country"],
+    if not has_data:
+        st.info(
+            "No dataset is available yet. Upload a CSV to explore it, or run the pipeline to build the demo data.",
+            icon=":material/database:",
         )
-        secondary_filter_label = "Crop" if crop_col else (
-            pretty_column_label(secondary_filter_col) if secondary_filter_col else "Category"
-        )
+        st.page_link(UPLOADS_PAGE, label="Go to uploads", icon=":material/upload_file:")
+        return
 
-        selected_district = "All"
-        selected_crop = "All"
-        districts: list[str] = []
-        crops: list[str] = []
+    # --- Filters ---------------------------------------------------------------
+    district_col = geography_column(active_df)
+    crop_col = pick_column(active_df, ["crop", "crop_type", "main_crop"])
+    secondary_col = crop_col or pick_category_column(
+        active_df,
+        exclude=[district_col] if district_col else [],
+        preferred_tokens=["crop", "type", "category", "indicator", "soil", "state", "region", "country"],
+    )
+    district_label = pretty_column_label(district_col) if district_col else "Region"
+    secondary_label = pretty_column_label(secondary_col) if secondary_col else "Category"
 
-        if district_col:
-            districts = ["All"] + sorted(active_df[district_col].dropna().astype(str).unique().tolist())
-            if st.session_state.get(district_filter_key) not in districts:
-                st.session_state[district_filter_key] = "All"
-            if st.session_state.get(district_filter_choice_key) not in districts:
-                st.session_state[district_filter_choice_key] = st.session_state[district_filter_key]
-            selected_district = st.session_state.get(district_filter_key, "All")
+    def filter_options(column: str | None) -> list[str]:
+        if not column:
+            return ["All"]
+        return ["All"] + sorted(active_df[column].dropna().astype(str).unique().tolist())
 
-        if secondary_filter_col:
-            crops = ["All"] + sorted(active_df[secondary_filter_col].dropna().astype(str).unique().tolist())
-            if st.session_state.get(crop_filter_key) not in crops:
-                st.session_state[crop_filter_key] = "All"
-            if st.session_state.get(crop_filter_choice_key) not in crops:
-                st.session_state[crop_filter_choice_key] = st.session_state[crop_filter_key]
-            selected_crop = st.session_state.get(crop_filter_key, "All")
+    districts = filter_options(district_col)
+    crops = filter_options(secondary_col)
+    for value_key, choice_key, options in (
+        (district_filter_key, district_filter_choice_key, districts),
+        (crop_filter_key, crop_filter_choice_key, crops),
+    ):
+        if st.session_state.get(value_key) not in options:
+            st.session_state[value_key] = "All"
+        if st.session_state.get(choice_key) not in options:
+            st.session_state[choice_key] = st.session_state[value_key]
 
-        filter_label = "Hide Filters ▲" if st.session_state[dashboard_filters_open_key] else "Show Filters ▼"
-        filter_summary = f"Region: {selected_district}"
-        if secondary_filter_col:
-            filter_summary = f"{filter_summary} | {secondary_filter_label}: {selected_crop}"
-
-        st.button(filter_label, key="dashboard_filter_toggle", on_click=toggle_dashboard_filters)
-        st.caption(filter_summary)
-
-        if st.session_state[dashboard_filters_open_key]:
-            filter_cols = st.columns(2, gap="small")
-            with filter_cols[0]:
-                if district_col:
-                    selected_district = st.pills(
-                        "Region",
-                        districts,
-                        key=district_filter_choice_key,
-                        width="stretch",
-                    ) or "All"
-                    st.session_state[district_filter_key] = selected_district
-                else:
-                    st.caption("No region field detected.")
-            with filter_cols[1]:
-                if secondary_filter_col:
-                    selected_crop = st.pills(
-                        secondary_filter_label,
-                        crops,
-                        key=crop_filter_choice_key,
-                        width="stretch",
-                    ) or "All"
-                    st.session_state[crop_filter_key] = selected_crop
-                else:
-                    st.caption("No category field detected.")
-
-    # Apply filters
-    if active_df is not None:
-        filtered_df = active_df.copy()
-        district_col = pick_geography_column(filtered_df)
-        crop_col = pick_column(filtered_df, ["crop", "crop_type", "main_crop"])
-        active_secondary_col = crop_col or pick_category_column(
-            filtered_df,
-            exclude=[district_col] if district_col else [],
-            preferred_tokens=["crop", "type", "category", "indicator", "soil", "state", "region", "country"],
-        )
-
-        if district_col and selected_district != "All":
-            filtered_df = filtered_df[filtered_df[district_col].astype(str) == selected_district]
-        if active_secondary_col and selected_crop != "All":
-            filtered_df = filtered_df[filtered_df[active_secondary_col].astype(str) == selected_crop]
-    else:
-        filtered_df = None
-
-    st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
-
-    if filtered_df is None or filtered_df.empty:
-        st.info("No survey dataset found yet. Add `data/raw/kobo_export.csv` or run the pipeline to unlock charts.")
-    else:
-        yield_col = pick_column(filtered_df, ["yield_tons", "yield", "yield_kg", "actual_yield_tons"])
-        ph_col = pick_column(filtered_df, ["soil_ph", "ph", "soil_ph_level"])
-        focus_numeric_col = yield_col or pick_numeric_column(
-            filtered_df,
-            preferred=["value", "target", "amount", "score", "prediction", "predicted_yield_tons"],
-        )
-        secondary_numeric_col = pick_numeric_column(
-            filtered_df,
-            preferred=["ph", "soil_ph", "soil_ph_level"],
-            exclude=[focus_numeric_col] if focus_numeric_col else [],
-        )
-
-        focus_numeric_series = (
-            pd.to_numeric(filtered_df[focus_numeric_col], errors="coerce").dropna()
-            if focus_numeric_col
-            else pd.Series(dtype="float64")
-        )
-        secondary_numeric_series = (
-            pd.to_numeric(filtered_df[secondary_numeric_col], errors="coerce").dropna()
-            if secondary_numeric_col
-            else pd.Series(dtype="float64")
-        )
-
-        total_surveys = int(filtered_df.shape[0])
-        total_cells = int(filtered_df.shape[0] * max(filtered_df.shape[1], 1))
-        filled_cells = int(filtered_df.notna().sum().sum())
-        completeness = (filled_cells / total_cells * 100.0) if total_cells else 0.0
-        kpi_category_col = pick_category_column(
-            filtered_df,
-            exclude=[focus_numeric_col] if focus_numeric_col else [],
-            preferred_tokens=["crop", "type", "category", "indicator", "state", "region", "country"],
-        )
-        kpi_category_unique = (
-            int(filtered_df[kpi_category_col].dropna().astype(str).nunique())
-            if kpi_category_col
-            else None
-        )
-
-        focus_label = pretty_column_label(focus_numeric_col) if focus_numeric_col else "Primary Metric"
-        focus_unit = "tons" if yield_col else "units"
-        focus_total = float(focus_numeric_series.sum()) if not focus_numeric_series.empty else None
-        focus_avg = float(focus_numeric_series.mean()) if not focus_numeric_series.empty else None
-        secondary_avg = float(secondary_numeric_series.mean()) if not secondary_numeric_series.empty else None
-
-        kpi_cols = st.columns(4, gap="small")
-        with kpi_cols[0]:
-            kpi_card(
-                "Total Surveys",
-                format_num(total_surveys, 0),
-                "Current filter",
-                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 17h2v4H3zm4-6h2v10H7zm4-4h2v14h-2zm4-8h2v18h-2zm4 12h2v6h-2z"/></svg>',
-                "#52d273",
+    selected_district = "All"
+    selected_crop = "All"
+    if district_col or secondary_col:
+        with st.container(horizontal=True, vertical_alignment="bottom", gap="small"):
+            if district_col:
+                selected_district = st.selectbox(district_label, districts, key=district_filter_choice_key, width=260)
+            if secondary_col:
+                selected_crop = st.selectbox(secondary_label, crops, key=crop_filter_choice_key, width=260)
+            st.button(
+                "Reset filters",
+                key="dashboard_reset_filters",
+                icon=":material/filter_alt_off:",
+                on_click=reset_global_filters,
+                disabled=selected_district == "All" and selected_crop == "All",
             )
-        with kpi_cols[1]:
-            if focus_numeric_col and focus_total is not None:
-                kpi_card(
-                    f"Total {focus_label}",
-                    format_num(focus_total),
-                    "Across visible records",
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm2 14h10v-2H7v2zm0-4h8v-2H7v2zm0-4h6V7H7v2z"/></svg>',
-                    "#34c2a6",
-                )
-            else:
-                kpi_card(
-                    "Data Columns",
-                    format_num(filtered_df.shape[1], 0),
-                    "Fields available",
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z"/></svg>',
-                    "#49a9f1",
-                )
-        with kpi_cols[2]:
-            if focus_numeric_col and focus_avg is not None:
-                kpi_card(
-                    f"Average {focus_label}",
-                    format_num(focus_avg),
-                    "Per visible record",
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16l4-4 4 4 8-8"/><path d="M4 20h16"/></svg>',
-                    "#8479ff",
-                )
-            else:
-                kpi_card(
-                    "Data Completeness",
-                    f"{completeness:.1f}%",
-                    "Non-missing cells",
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm-1 14.5l-3.5-3.5 1.41-1.41L11 13.67l5.59-5.59L18 9.5 11 16.5z"/></svg>',
-                    "#d26cf3",
-                )
-        with kpi_cols[3]:
-            if secondary_numeric_col and secondary_avg is not None:
-                kpi_card(
-                    f"Average {pretty_column_label(secondary_numeric_col)}",
-                    format_num(secondary_avg, 2),
-                    "Detected comparison metric",
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a9 9 0 0 0-9 9v8a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-8a9 9 0 0 0-9-9zm-1 14h-2v-5h2zm4 0h-2v-3h2zm0-5h-2V7h2z"/></svg>',
-                    "#f39a58",
-                )
-            elif kpi_category_col and kpi_category_unique is not None:
-                kpi_card(
-                    f"{pretty_column_label(kpi_category_col)} Classes",
-                    format_num(kpi_category_unique, 0),
-                    "Distinct groups in view",
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M5 4h14v3H5zm0 6h14v3H5zm0 6h14v3H5z"/></svg>',
-                    "#f0627a",
-                )
-            else:
-                kpi_card(
-                    "Data Completeness",
-                    f"{completeness:.1f}%",
-                    "Non-missing cells",
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm-1 14.5l-3.5-3.5 1.41-1.41L11 13.67l5.59-5.59L18 9.5 11 16.5z"/></svg>',
-                    "#d26cf3",
-                )
+    st.session_state[district_filter_key] = selected_district
+    st.session_state[crop_filter_key] = selected_crop
 
-        dashboard_date_col = pick_datetime_column(
-            filtered_df,
-            preferred=["date", "survey_date", "collection_date", "registration_date", "sample_date", "created_at", "timestamp"],
-        )
-        comparison_candidates: list[str] = []
-        if district_col and selected_district == "All":
-            comparison_candidates.append(district_col)
-        if active_secondary_col and selected_crop == "All" and active_secondary_col not in comparison_candidates:
-            comparison_candidates.append(active_secondary_col)
-        if kpi_category_col and kpi_category_col not in comparison_candidates:
-            comparison_candidates.append(kpi_category_col)
+    filtered_df = active_df
+    if district_col and selected_district != "All":
+        filtered_df = filtered_df[filtered_df[district_col].astype(str) == selected_district]
+    if secondary_col and selected_crop != "All":
+        filtered_df = filtered_df[filtered_df[secondary_col].astype(str) == selected_crop]
+    if filtered_df.empty:
+        st.warning("No records match these filters.", icon=":material/filter_alt_off:")
+        return
 
-        dashboard_brief = compose_dashboard_brief(
+    # --- Headline figures ------------------------------------------------------
+    yield_col = pick_column(
+        filtered_df,
+        ["yield_kg_per_ha", "yield_t_per_ha", "yield_tons", "yield", "yield_kg", "actual_yield_tons"],
+    )
+    focus_col = yield_col or pick_numeric_column(
+        filtered_df,
+        preferred=["value", "target", "amount", "score", "prediction", "predicted_yield_tons"],
+    )
+    focus_series = (
+        pd.to_numeric(filtered_df[focus_col], errors="coerce").dropna() if focus_col else pd.Series(dtype="float64")
+    )
+    focus_label = pretty_column_label(focus_col) if focus_col else "Primary measure"
+    trend_time_col = next(iter(time_columns(filtered_df)), None)
+    total_cells = int(filtered_df.shape[0] * max(filtered_df.shape[1], 1))
+    completeness = (int(filtered_df.notna().sum().sum()) / total_cells * 100.0) if total_cells else 0.0
+
+    records_note = "In the current filter"
+    if trend_time_col:
+        periods = period_values(filtered_df[trend_time_col]).dropna()
+        if not periods.empty:
+            records_note = f"Covering {int(periods.min())}-{int(periods.max())}"
+
+    def distinct_count(column: str | None) -> int:
+        return int(filtered_df[column].dropna().astype(str).nunique()) if column else 0
+
+    kpi_cols = st.columns(4, gap="small")
+    with kpi_cols[0]:
+        kpi_card("Records", format_num(len(filtered_df), 0), records_note, KPI_ICONS["records"], "#52d273")
+    with kpi_cols[1]:
+        if not focus_series.empty:
+            kpi_card(
+                f"Average {lower_first(focus_label)}",
+                format_num(focus_series.mean()),
+                f"Median {format_num(focus_series.median())}",
+                KPI_ICONS["average"],
+                "#34c2a6",
+            )
+        else:
+            kpi_card("Completeness", f"{completeness:.1f}%", "Non-missing cells", KPI_ICONS["complete"], "#34c2a6")
+    with kpi_cols[2]:
+        if district_col:
+            kpi_card(
+                plural_label(district_label),
+                format_num(distinct_count(district_col), 0),
+                "Distinct in view",
+                KPI_ICONS["place"],
+                "#49a9f1",
+            )
+        else:
+            kpi_card("Fields", format_num(filtered_df.shape[1], 0), "Columns available", KPI_ICONS["list"], "#49a9f1")
+    with kpi_cols[3]:
+        if secondary_col:
+            kpi_card(
+                plural_label(secondary_label),
+                format_num(distinct_count(secondary_col), 0),
+                "Distinct in view",
+                KPI_ICONS["category"],
+                "#8479ff",
+            )
+        else:
+            kpi_card("Completeness", f"{completeness:.1f}%", "Non-missing cells", KPI_ICONS["complete"], "#8479ff")
+
+    # --- Insights --------------------------------------------------------------
+    kpi_category_col = pick_category_column(
+        filtered_df,
+        exclude=[focus_col] if focus_col else [],
+        preferred_tokens=["crop", "type", "category", "indicator", "state", "region", "country"],
+    )
+    comparison_candidates: list[str] = []
+    if district_col and selected_district == "All":
+        comparison_candidates.append(district_col)
+    if secondary_col and selected_crop == "All" and secondary_col not in comparison_candidates:
+        comparison_candidates.append(secondary_col)
+    if kpi_category_col and kpi_category_col not in comparison_candidates:
+        comparison_candidates.append(kpi_category_col)
+
+    st.subheader("Insights")
+    render_insight_cards(
+        build_dashboard_insights(
             filtered_df,
-            focus_numeric_col,
-            date_col=dashboard_date_col,
-            comparison_col=comparison_candidates[0] if comparison_candidates else None,
-        )
-        dashboard_insights = build_dashboard_insights(
-            filtered_df,
-            focus_numeric_col,
+            focus_col,
             comparison_candidates=comparison_candidates,
-            date_col=dashboard_date_col,
+            date_col=pick_datetime_column(
+                filtered_df,
+                preferred=["date", "survey_date", "collection_date", "registration_date", "sample_date", "created_at", "timestamp"],
+            ),
             category_col=kpi_category_col,
+        ),
+        per_row=2,
+    )
+
+    # --- Trends ----------------------------------------------------------------
+    if focus_col:
+        st.subheader("Trends")
+        if secondary_col and selected_crop == "All":
+            st.caption(
+                f"These averages pool every {lower_first(secondary_label)}. Pick one above for a like-for-like comparison."
+            )
+        rank_by = (
+            district_col
+            if district_col and selected_district == "All"
+            else secondary_col if secondary_col and selected_crop == "All" else None
         )
-
-        st.markdown("### Insights")
-        render_insight_cards(dashboard_insights, per_row=2)
-        st.markdown('<div class="stack-gap"></div>', unsafe_allow_html=True)
-
-        # Data Narrative Section
-        st.markdown("### Trends")
-        col_trend, col_bar = st.columns(2)
-        
-        with col_trend:
-            st.markdown("#### Yield Trends Over Time")
-            # Placeholder for line chart
-            if focus_numeric_col:
-                # Assume there's a date column
-                date_col = pick_column(filtered_df, ["date", "survey_date", "collection_date"])
-                if date_col:
-                    chart_data = filtered_df[[date_col, focus_numeric_col]].dropna()
-                    chart_data[date_col] = pd.to_datetime(chart_data[date_col], errors='coerce')
-                    chart_data = chart_data.dropna().sort_values(date_col)
-                    st.line_chart(chart_data.set_index(date_col)[focus_numeric_col])
-                else:
-                    st.info("No date column found for trend analysis.")
+        trend_panel, rank_panel = st.columns(2, gap="medium")
+        with trend_panel, st.container(border=True, height="stretch"):
+            st.markdown(f"**{focus_label} over time**")
+            means = period_means(filtered_df, focus_col, trend_time_col) if trend_time_col else pd.DataFrame()
+            if len(means) >= 2:
+                trend_chart = (
+                    alt.Chart(means)
+                    .mark_line(
+                        strokeWidth=2.5,
+                        interpolate="monotone",
+                        color=BRAND_SERIES,
+                        point=alt.OverlayMarkDef(size=26, color=BRAND_SERIES),
+                    )
+                    .encode(
+                        x=alt.X("period:Q", title=None, axis=alt.Axis(format="d")),
+                        y=alt.Y("value:Q", title=f"Mean {lower_first(focus_label)}"),
+                        tooltip=[
+                            alt.Tooltip("period:Q", title=pretty_column_label(trend_time_col), format="d"),
+                            alt.Tooltip("value:Q", title=f"Mean {lower_first(focus_label)}", format=",.1f"),
+                            alt.Tooltip("n:Q", title="Records", format=","),
+                        ],
+                    )
+                    .properties(height=300)
+                    .configure_view(stroke=None)
+                    .configure_axis(gridOpacity=0.18, labelColor=AXIS_INK, titleColor=AXIS_INK)
+                )
+                st.altair_chart(trend_chart, width="stretch")
             else:
-                st.info("No numeric column for trend analysis.")
-        
-        with col_bar:
-            st.markdown("#### Regional Comparison")
-            if district_col and focus_numeric_col:
-                regional_avg = filtered_df.groupby(district_col)[focus_numeric_col].mean().dropna().sort_values(ascending=False).head(10)
-                st.bar_chart(regional_avg)
-            else:
-                st.info("No region or numeric data for comparison.")
+                st.caption("No usable time column in this view, so there is no trend to draw.")
 
-        seed_col_present = pick_column(filtered_df, ["improved_seed_used", "improved_seed", "seed_improved"]) is not None
-        
-        # Auto-detect best adoption metric to display
-        adoption_metrics = detect_adoption_metrics(filtered_df)
-        if adoption_metrics:
-            # Use the first (highest priority) adoption metric found
-            metric_col, metric_label, _ = adoption_metrics[0]
-            adoption_rate, valid_seed_df, adopters_df = adoption_metric_donut(filtered_df, metric_col, metric_label)
-        else:
-            # Fallback to seed adoption for backwards compatibility
-            adoption_rate, valid_seed_df, adopters_df = seed_adoption_donut(filtered_df)
-            metric_label = "Seed Adoption"
-        
-        crop_legend = crop_distribution_legend(adopters_df)
-        fill_segments = adoption_crop_segments(adoption_rate, adopters_df)
-        legend_html = "".join(
-            f'<span class="legend-chip"><span class="legend-dot" style="--dot:{entry["color"]};"></span>{entry["crop"]} {entry["share_pct"]:.0f}%</span>'
-            for entry in crop_legend
-        )
-
-        snapshot_col = pick_category_column(
-            filtered_df,
-            exclude=[focus_numeric_col] if focus_numeric_col else [],
-            preferred_tokens=["crop", "type", "category", "indicator", "state", "region", "country", "district"],
-        )
-        snapshot_share = (
-            filtered_df[snapshot_col].dropna().astype(str).value_counts(normalize=True).head(7)
-            if snapshot_col
-            else pd.Series(dtype="float64")
-        )
-
-        donut_col, text_col = st.columns([1, 1.4], gap="large")
-        if seed_col_present:
-            with donut_col:
-                donut_bg = str(THEME["secondary_bg"])
-                donut_border = str(THEME["line"])
-                donut_value_color = str(THEME["text"])
-                donut_label_color = str(THEME["muted"])
-                donut_track = str(THEME["donut_track"])
-                donut_component_id = f"donut-{uuid.uuid4().hex[:10]}"
-
-                donut_html = f"""
-                <style>
-                    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap');
-                    #{donut_component_id}.donut-root {{
-                        font-family: 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                        background: var(--donut-bg, {donut_bg});
-                        border: 1px solid var(--donut-border, {donut_border});
-                        border-radius: 12px;
-                        min-height: 214px;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        position: relative;
-                        overflow: hidden;
-                    }}
-                    #{donut_component_id} .donut-value {{
-                        font-family: 'Space Grotesk', 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                        font-size: 1.95rem;
-                        line-height: 1;
-                        color: var(--donut-value, {donut_value_color});
-                        letter-spacing: 0.01em;
-                    }}
-                    #{donut_component_id} .donut-label {{
-                        margin-top: 0.25rem;
-                        font-family: 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                        font-size: 0.95rem;
-                        color: var(--donut-label, {donut_label_color});
-                        font-weight: 600;
-                    }}
-                    #{donut_component_id} .donut-seg {{
-                        fill: none;
-                        stroke-width: 20;
-                        stroke-linecap: butt;
-                        stroke-dasharray: 0 100;
-                    }}
-                </style>
-                <div id="{donut_component_id}" class="donut-root">
-                    <div style="position:relative; width:248px; height:150px;">
-                        <svg viewBox="0 0 248 150" role="img" aria-label="{metric_label.lower()} gauge" style="width:248px;height:150px;display:block;">
-                            <path d="M 20 130 A 104 104 0 0 1 228 130" pathLength="100"
-                                  fill="none" stroke="{donut_track}" stroke-width="20" stroke-linecap="butt"></path>
-                            {"".join(
-                                f'<path class="donut-seg" d="M 20 130 A 104 104 0 0 1 228 130" pathLength="100" '
-                                f'stroke="{seg["color"]}" stroke-dashoffset="-{seg["start"]:.4f}" '
-                                f'data-final="{seg["length"]:.4f} 100" data-delay="{int(float(seg["start"]) * 10)}"></path>'
-                                for seg in fill_segments
-                            )}
-                        </svg>
-                        <div style="
-                            position:absolute;
-                            left:50%;
-                            bottom:8px;
-                            transform:translateX(-50%);
-                            text-align:center;
-                        ">
-                            <div class="donut-value">{adoption_rate:.1f}%</div>
-                            <div class="donut-label">{metric_label}</div>
-                        </div>
-                    </div>
-                </div>
-                <script>
-                (() => {{
-                    const root = document.getElementById("{donut_component_id}");
-                    if (!root) return;
-
-                    const setThemeFromParent = () => {{
-                        try {{
-                            const parentDoc = window.parent?.document;
-                            if (!parentDoc) return;
-                            const appContainer =
-                                parentDoc.querySelector('[data-testid="stAppViewContainer"]') ||
-                                parentDoc.body;
-                            const appStyles = window.parent.getComputedStyle(appContainer);
-                            const bg = appStyles.backgroundColor || "";
-                            const text = appStyles.color || "";
-                            const m = bg.match(/\\d+/g);
-                            let dark = {str(IS_DARK_THEME).lower()};
-                            if (m && m.length >= 3) {{
-                                const r = Number(m[0]);
-                                const g = Number(m[1]);
-                                const b = Number(m[2]);
-                                const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-                                dark = luminance < 0.54;
-                            }}
-                            if (dark) {{
-                                root.style.setProperty("--donut-bg", "{THEME['secondary_bg'] if IS_DARK_THEME else '#101a24'}");
-                                root.style.setProperty("--donut-border", "rgba(127, 207, 159, 0.28)");
-                                root.style.setProperty("--donut-value", text || "#e7ece9");
-                                root.style.setProperty("--donut-label", "rgba(210, 224, 216, 0.72)");
-                            }} else {{
-                                root.style.setProperty("--donut-bg", "{THEME['secondary_bg'] if not IS_DARK_THEME else '#f3f7f4'}");
-                                root.style.setProperty("--donut-border", "rgba(47, 106, 74, 0.22)");
-                                root.style.setProperty("--donut-value", text || "#24312d");
-                                root.style.setProperty("--donut-label", "rgba(64, 84, 73, 0.72)");
-                            }}
-                        }} catch (e) {{
-                            // Keep server-provided defaults.
-                        }}
-                    }};
-
-                    const animateFill = () => {{
-                        if (root.dataset.animated === "1") return;
-                        root.dataset.animated = "1";
-                        const segments = root.querySelectorAll(".donut-seg");
-                        segments.forEach((seg) => {{
-                            const finalDash = seg.getAttribute("data-final") || "0 100";
-                            const delay = Number(seg.getAttribute("data-delay") || "0");
-                            seg.style.transition = `stroke-dasharray 640ms ease ${{delay}}ms`;
-                            requestAnimationFrame(() => {{
-                                seg.style.strokeDasharray = finalDash;
-                            }});
-                        }});
-                    }};
-
-                    setThemeFromParent();
-                    window.addEventListener("resize", setThemeFromParent);
-
-                    try {{
-                        const frameEl = window.frameElement;
-                        if (frameEl && window.parent?.IntersectionObserver) {{
-                            const parentObserver = new window.parent.IntersectionObserver((entries) => {{
-                                entries.forEach((entry) => {{
-                                    if (entry.isIntersecting) {{
-                                        animateFill();
-                                        parentObserver.disconnect();
-                                    }}
-                                }});
-                            }}, {{ threshold: 0.35 }});
-                            parentObserver.observe(frameEl);
-                        }} else {{
-                            animateFill();
-                        }}
-                    }} catch (e) {{
-                        animateFill();
-                    }}
-                }})();
-                </script>
-                """
-                components.html(donut_html, height=224, scrolling=False)
-            with text_col:
-                st.markdown(f"### {metric_label} Snapshot")
-                st.write(
-                    f"The ring colors represent crop distribution among records with {metric_label.lower()} in the current filter."
-                )
-                st.write(
-                    f"When district or {secondary_filter_label.lower()} filters change, segment sizes and legend shares update automatically."
-                )
-                if crop_legend:
-                    st.markdown(f'<div class="crop-legend">{legend_html}</div>', unsafe_allow_html=True)
-                else:
-                    st.caption("No adoption records in the current filter.")
-                st.markdown(
-                    '<p class="legend-note">Arc fill shows adoption rate. Legend colors indicate crop mix within adopting records.</p>',
-                    unsafe_allow_html=True,
-                )
-        else:
-            with donut_col:
-                st.markdown('<div class="panel"><h4>Category Snapshot</h4></div>', unsafe_allow_html=True)
-                if snapshot_col and not snapshot_share.empty:
-                    snapshot_df = pd.DataFrame(
+        with rank_panel, st.container(border=True, height="stretch"):
+            if rank_by:
+                ranked = (
+                    pd.DataFrame(
                         {
-                            "category": snapshot_share.index.tolist(),
-                            "share": (snapshot_share.values * 100.0),
+                            "category": filtered_df[rank_by].astype(str).str.strip(),
+                            "value": pd.to_numeric(filtered_df[focus_col], errors="coerce"),
                         }
                     )
-                    category_chart = (
-                        alt.Chart(snapshot_df)
-                        .mark_bar(color="#2b8a4b")
-                        .encode(
-                            x=alt.X("share:Q", title="Share (%)"),
-                            y=alt.Y("category:N", sort="-x", title=pretty_column_label(snapshot_col)),
-                            tooltip=[
-                                alt.Tooltip("category:N", title=pretty_column_label(snapshot_col)),
-                                alt.Tooltip("share:Q", title="Share (%)", format=".1f"),
-                            ],
-                        )
-                        .properties(height=220)
-                    )
-                    st.altair_chart(category_chart, width="stretch")
+                    .dropna()
+                    .groupby("category")["value"]
+                    .agg(["mean", "count"])
+                )
+                ranked = ranked[ranked["count"] >= 3]["mean"].nlargest(10).rename("value").reset_index()
+                rank_label = pretty_column_label(rank_by)
+                st.markdown(f"**Top {len(ranked)} by average {lower_first(focus_label)}**")
+                if ranked.empty:
+                    st.caption(f"No {lower_first(rank_label)} has at least three records.")
                 else:
-                    st.info("No suitable category column found for a snapshot chart.")
-            with text_col:
-                st.write(
-                    f"Smart mode is active for current CSV. Snapshot cards and charts are inferred from available columns ({filtered_df.shape[1]} fields)."
-                )
-                if snapshot_col and not snapshot_share.empty:
-                    st.write(
-                        f"Primary grouping field: `{snapshot_col}`. Top segment: `{snapshot_share.index[0]}` ({snapshot_share.iloc[0] * 100:.1f}%)."
+                    st.altair_chart(
+                        ranked_bar_chart(ranked, rank_label, f"Mean {lower_first(focus_label)}", ",.1f"),
+                        width="stretch",
                     )
-                if focus_numeric_col and not focus_numeric_series.empty:
-                    st.write(
-                        f"Primary metric field: `{focus_numeric_col}`. Median value in current filter: {focus_numeric_series.median():.2f}."
-                    )
-                st.markdown(
-                    '<p class="legend-note">When you switch datasets, the snapshot auto-picks the best available category and numeric fields.</p>',
-                    unsafe_allow_html=True,
-                )
+                    st.caption(f"Grouped by {lower_first(rank_label)}; groups with fewer than three records are left out.")
+            else:
+                st.markdown("**Ranking**")
+                st.caption("Clear a filter to rank the remaining groups against each other.")
 
-        diff = data_diff_summary()
-        show_contract = active_df is not None and not active_df.empty
-        show_diff = bool(settings.get("show_data_diff", True) and diff)
-
-        if show_contract or show_diff:
-            st.markdown("### Data Quality")
+    # --- Adoption or composition ----------------------------------------------
+    adoption_metrics = detect_adoption_metrics(filtered_df)
+    if adoption_metrics:
+        metric_col, metric_label, _ = adoption_metrics[0]
+        adoption_rate, _, adopters_df = adoption_metric_donut(filtered_df, metric_col, metric_label)
+        crop_legend = crop_distribution_legend(adopters_df)
+        st.subheader(f"{metric_label} adoption")
+        gauge_panel, text_panel = st.columns([1, 1.4], gap="large", vertical_alignment="center")
+        with gauge_panel, st.container(border=True):
+            st.html(gauge_html(adoption_rate, f"{metric_label} adoption", adoption_crop_segments(adoption_rate, adopters_df)))
+        with text_panel:
             st.markdown(
-                '<div class="section-hint">Contract checks and transformation diagnostics are grouped in tabs to keep the dashboard easier to scan.</div>',
-                unsafe_allow_html=True,
+                f"**{adoption_rate:.1f}%** of records that answered report {lower_first(metric_label)}."
             )
-
-            if show_contract and show_diff:
-                contract_tab, diff_tab = st.tabs(["Contract Check", "Raw -> Clean Diff"])
-            elif show_contract:
-                contract_tab = st.tabs(["Contract Check"])[0]
-                diff_tab = None
+            if crop_legend:
+                st.markdown(legend_chips_html(crop_legend), unsafe_allow_html=True)
+                st.caption("The arc fill is the adoption rate; its colours split adopting records by crop.")
             else:
-                contract_tab = None
-                diff_tab = st.tabs(["Raw -> Clean Diff"])[0]
-
-            if contract_tab is not None:
-                with contract_tab:
-                    contract_rows = pd.DataFrame(data_contract_check(active_df))
-                    st.dataframe(contract_rows, width="stretch", hide_index=True)
-
-            if diff_tab is not None:
-                with diff_tab:
-                    d1, d2, d3 = st.columns(3, gap="medium")
-                    with d1:
-                        kpi_card("Raw Columns", str(diff["raw_cols"]), f"Rows: {diff['raw_shape'][0]}")
-                    with d2:
-                        kpi_card("Clean Columns", str(diff["clean_cols"]), f"Rows: {diff['clean_shape'][0]}")
-                    with d3:
-                        kpi_card("Predictions Added", str(len(diff["added_by_prediction"])), "New output fields")
-
-                    with st.expander("See field-level changes", expanded=False):
-                        st.write(f"- Normalized/renamed fields: {len(diff['renamed_pairs'])}")
-                        st.write(f"- Removed after cleaning: {len(diff['removed_after_clean'])}")
-                        st.write(f"- Added by prediction: {len(diff['added_by_prediction'])}")
-
-                        if diff["renamed_pairs"]:
-                            st.markdown("**Renamed Fields**")
-                            st.dataframe(pd.DataFrame(diff["renamed_pairs"]).head(25), width="stretch")
-
-                        if diff["removed_after_clean"]:
-                            st.markdown("**Removed/Absent After Cleaning**")
-                            st.dataframe(
-                                pd.DataFrame({"normalized_raw_column": diff["removed_after_clean"]}).head(25),
-                                width="stretch",
-                            )
-
-                        if diff["added_by_prediction"]:
-                            st.markdown("**Prediction Output Columns**")
-                            st.dataframe(
-                                pd.DataFrame({"prediction_column": diff["added_by_prediction"]}),
-                                width="stretch",
-                            )
-            st.markdown('<div class="stack-gap"></div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-        distribution_col = focus_numeric_col
-        distribution_title = f"{pretty_column_label(distribution_col)} Distribution" if distribution_col else "Numeric Distribution"
-        st.markdown(f'<div class="panel"><h4>{distribution_title}</h4></div>', unsafe_allow_html=True)
-        if distribution_col:
-            series = pd.to_numeric(filtered_df[distribution_col], errors="coerce").dropna()
-            if series.empty:
-                st.warning(f"Values in `{distribution_col}` are not numeric in the current view.")
-            else:
-                display_series = series.copy()
-                upper_cap = float(series.quantile(0.95))
-                outlier_count = int((series > upper_cap).sum())
-                if outlier_count > 0 and len(series) >= 8:
-                    display_series = series.clip(upper=upper_cap)
-
-                if len(display_series) >= 4:
-                    bins = np.histogram_bin_edges(display_series, bins="fd")
-                    if len(bins) < 5 or len(bins) > 16:
-                        bins = int(settings.get("dashboard_hist_bins", 10))
-                else:
-                    bins = int(settings.get("dashboard_hist_bins", 8))
-                if isinstance(bins, np.ndarray):
-                    maxbins = int(max(5, min(40, len(bins) - 1)))
-                else:
-                    maxbins = int(bins)
-                n_obs = int(len(display_series))
-                v_min = float(display_series.min())
-                v_max = float(display_series.max())
-                v_range = max(v_max - v_min, 1e-9)
-                use_step_bins = n_obs <= 25 and v_range > 0
-                bin_step = None
-                if use_step_bins:
-                    target_bins = max(6, min(12, int(np.sqrt(n_obs) * 2)))
-                    raw_step = max(0.5, v_range / target_bins)
-                    magnitude = 10 ** np.floor(np.log10(raw_step))
-                    candidates = np.array([1.0, 2.0, 2.5, 5.0, 10.0]) * magnitude
-                    larger = candidates[candidates >= raw_step]
-                    bin_step = float(larger[0] if len(larger) else candidates[-1])
-
-                xlabel = pretty_column_label(distribution_col)
-                if yield_col and distribution_col == yield_col:
-                    xlabel = "Yield (tons)"
-                if outlier_count > 0 and len(series) >= 8:
-                    xlabel = f"{xlabel} (display capped at {upper_cap:.1f})"
-
-                chart_df = pd.DataFrame({"metric_value": display_series.to_numpy()})
-                hist = (
-                    alt.Chart(chart_df)
-                    .mark_bar(
-                        color="#2fbd66" if IS_DARK_THEME else "#2c9e5b",
-                        opacity=0.9,
-                        stroke="#1d7343" if IS_DARK_THEME else "#2a7e4a",
-                        strokeWidth=1,
-                    )
-                    .encode(
-                        x=alt.X(
-                            "metric_value:Q",
-                            bin=alt.Bin(step=bin_step) if use_step_bins else alt.Bin(maxbins=maxbins),
-                            title=xlabel,
-                        ),
-                        y=alt.Y("count():Q", title="Count"),
-                        tooltip=[alt.Tooltip("count():Q", title="Count")],
-                    )
-                    .properties(height=380)
-                )
-                rug = (
-                    alt.Chart(chart_df)
-                    .mark_tick(
-                        color="#89f0b0" if IS_DARK_THEME else "#2a7e4a",
-                        thickness=1.2,
-                        size=10,
-                        opacity=0.65,
-                    )
-                    .encode(
-                        x=alt.X("metric_value:Q"),
-                        y=alt.value(374),
-                        tooltip=[alt.Tooltip("metric_value:Q", title=pretty_column_label(distribution_col), format=".2f")],
-                    )
-                )
-
-                mean_rule = (
-                    alt.Chart(pd.DataFrame({"x": [float(display_series.mean())]}))
-                    .mark_rule(color="#f7b267", strokeDash=[8, 4], strokeWidth=2)
-                    .encode(x="x:Q")
-                )
-                median_rule = (
-                    alt.Chart(pd.DataFrame({"x": [float(display_series.median())]}))
-                    .mark_rule(color="#7db7ff", strokeDash=[7, 3, 2, 3], strokeWidth=2)
-                    .encode(x="x:Q")
-                )
-
-                chart = (
-                    (hist + rug + mean_rule + median_rule)
-                    .configure_view(stroke=None)
-                    .configure_axis(gridOpacity=0.28)
-                )
-
-                st.altair_chart(chart, width="stretch")
-                unit_suffix = " t" if (yield_col and distribution_col == yield_col) else ""
-                st.caption(
-                    f"Mean {display_series.mean():.2f}{unit_suffix} | Median {display_series.median():.2f}{unit_suffix}"
-                )
-                if outlier_count > 0 and len(series) >= 8:
-                    noun = "record" if outlier_count == 1 else "records"
-                    verb = "was" if outlier_count == 1 else "were"
-                    st.caption(
-                        f"{outlier_count} high-value {noun} {verb} capped in chart display for readability; underlying data is unchanged."
-                    )
-        else:
-            st.warning("No numeric field detected in the current dataset.")
-
-        chart_col = pick_geography_column(filtered_df)
-        fallback_group_col = pick_category_column(
+                st.caption("No adopting records in the current filter.")
+    else:
+        snapshot_col = pick_category_column(
             filtered_df,
-            exclude=[distribution_col, snapshot_col] if distribution_col and snapshot_col else (
-                [distribution_col] if distribution_col else ([snapshot_col] if snapshot_col else [])
-            ),
-            preferred_tokens=["district", "region", "state", "country", "crop", "type", "category", "indicator"],
+            exclude=[focus_col] if focus_col else [],
+            preferred_tokens=["crop", "type", "category", "indicator", "state", "region", "country", "district"],
         )
-        group_col = chart_col or fallback_group_col
-        group_title = "Farmer Distribution" if chart_col else "Category Distribution"
-        st.markdown(f'<div class="panel"><h4>{group_title}</h4></div>', unsafe_allow_html=True)
-        if group_col:
-            top_regions = (
-                filtered_df[group_col]
-                .astype(str)
-                .value_counts()
-                .head(int(settings.get("top_regions_limit", 10)))
-                .sort_values()
-            )
-            fig, ax = plt.subplots(figsize=(10, 4.8))
-            fig.patch.set_facecolor(PAGE_CANVAS)
-            ax.barh(top_regions.index, top_regions.values, color="#f7b267")
-            ax.set_xlabel("Survey Count")
-            ax.set_ylabel("")
-            style_chart_axes(ax, dark=IS_DARK_THEME)
-            ax.grid(alpha=0.22, axis="x")
-            fig.tight_layout()
-            st.pyplot(fig, width="stretch")
-            if chart_col:
-                st.caption(f"Grouping field: `{group_col}`")
+        if snapshot_col:
+            shares = filtered_df[snapshot_col].dropna().astype(str).str.strip().value_counts(normalize=True)
+            snapshot_label = pretty_column_label(snapshot_col)
+            st.subheader(f"Records by {lower_first(snapshot_label)}")
+            chart_panel, text_panel = st.columns([1.4, 1], gap="large", vertical_alignment="center")
+            with chart_panel, st.container(border=True):
+                top_shares = (shares.head(8) * 100.0).rename("value").rename_axis("category").reset_index()
+                st.altair_chart(ranked_bar_chart(top_shares, snapshot_label, "Share of records (%)", ".1f"), width="stretch")
+            with text_panel:
+                lines = [
+                    f"- **{html.escape(str(shares.index[0]))}** is the largest group, with {shares.iloc[0] * 100:.1f}% of records.",
+                    f"- {len(shares):,} distinct values in total; the chart shows the top {min(8, len(shares))}.",
+                ]
+                if not focus_series.empty:
+                    lines.append(f"- Median {lower_first(focus_label)} in this view: {format_num(focus_series.median())}.")
+                st.markdown("\n".join(lines))
+
+    # --- Distribution ----------------------------------------------------------
+    st.subheader("Distribution")
+    if focus_series.empty:
+        st.info("No numeric measure detected in the current dataset.", icon=":material/info:")
+    else:
+        distribution_panel, count_panel = st.columns([1.4, 1], gap="medium")
+        with distribution_panel, st.container(border=True, height="stretch"):
+            st.markdown(f"**{focus_label}**")
+            series = focus_series
+            display_series = series
+            upper_cap = float(series.quantile(0.95))
+            outlier_count = int((series > upper_cap).sum())
+            capped = outlier_count > 0 and len(series) >= 8
+            if capped:
+                display_series = series.clip(upper=upper_cap)
+
+            if len(display_series) >= 4:
+                edges = np.histogram_bin_edges(display_series, bins="fd")
+                maxbins = (
+                    int(max(5, min(40, len(edges) - 1)))
+                    if 5 <= len(edges) <= 16
+                    else int(settings.get("dashboard_hist_bins", 10))
+                )
             else:
-                st.caption(f"No geography field detected. Using `{group_col}` as the best available grouping field.")
-        else:
-            st.info("No suitable grouping field detected for this dataset.")
+                maxbins = int(settings.get("dashboard_hist_bins", 8))
+            n_obs = int(len(display_series))
+            v_range = float(display_series.max() - display_series.min())
+            bin_spec = alt.Bin(maxbins=maxbins)
+            if n_obs <= 25 and v_range > 0:
+                target_bins = max(6, min(12, int(np.sqrt(n_obs) * 2)))
+                raw_step = max(0.5, v_range / target_bins)
+                magnitude = 10 ** np.floor(np.log10(raw_step))
+                steps = np.array([1.0, 2.0, 2.5, 5.0, 10.0]) * magnitude
+                larger = steps[steps >= raw_step]
+                bin_spec = alt.Bin(step=float(larger[0] if len(larger) else steps[-1]))
 
-        st.markdown('<div class="panel"><h4>Key Insights</h4></div>', unsafe_allow_html=True)
-        insight_items = []
-        if distribution_col and not focus_numeric_series.empty:
-            q1 = float(focus_numeric_series.quantile(0.25))
-            q3 = float(focus_numeric_series.quantile(0.75))
-            insight_items.append(
-                f"Interquartile range for {pretty_column_label(distribution_col)} is {q1:.2f} to {q3:.2f}."
+            x_title = f"{focus_label} (display capped at {format_num(upper_cap)})" if capped else focus_label
+            chart_df = pd.DataFrame({"metric_value": display_series.to_numpy()})
+            hist = (
+                alt.Chart(chart_df)
+                .mark_bar(color="#2fbd66", opacity=0.9, cornerRadiusTopLeft=2, cornerRadiusTopRight=2)
+                .encode(
+                    x=alt.X("metric_value:Q", bin=bin_spec, title=x_title),
+                    y=alt.Y("count():Q", title="Records"),
+                    tooltip=[alt.Tooltip("count():Q", title="Records", format=",")],
+                )
             )
-        if secondary_numeric_col and not secondary_numeric_series.empty:
-            insight_items.append(
-                f"Average {pretty_column_label(secondary_numeric_col)} in view is {secondary_numeric_series.mean():.2f}."
+            stats = pd.DataFrame(
+                {"stat": ["Mean", "Median"], "x": [float(display_series.mean()), float(display_series.median())]}
             )
-        if selected_district != "All":
-            insight_items.append(f"Filters currently scoped to district: {selected_district}.")
-        if selected_crop != "All":
-            insight_items.append(f"{secondary_filter_label} focus: {selected_crop}.")
+            rules = (
+                alt.Chart(stats)
+                .mark_rule(strokeWidth=2)
+                .encode(
+                    x="x:Q",
+                    color=alt.Color(
+                        "stat:N",
+                        scale=alt.Scale(domain=["Mean", "Median"], range=["#f7b267", "#7db7ff"]),
+                        legend=alt.Legend(title=None, orient="top", labelColor=AXIS_INK),
+                    ),
+                    strokeDash=alt.StrokeDash(
+                        "stat:N",
+                        scale=alt.Scale(domain=["Mean", "Median"], range=[[8, 4], [2, 3]]),
+                        legend=None,
+                    ),
+                    tooltip=[alt.Tooltip("stat:N", title="Statistic"), alt.Tooltip("x:Q", title="Value", format=",.1f")],
+                )
+            )
+            st.altair_chart(
+                (hist + rules)
+                .properties(height=300)
+                .configure_view(stroke=None)
+                .configure_axis(gridOpacity=0.18, labelColor=AXIS_INK, titleColor=AXIS_INK),
+                width="stretch",
+            )
+            q1, q3 = float(series.quantile(0.25)), float(series.quantile(0.75))
+            st.caption(
+                f"Mean {format_num(series.mean())} · median {format_num(series.median())} · "
+                f"middle half between {format_num(q1)} and {format_num(q3)}."
+            )
+            if capped:
+                noun = "record is" if outlier_count == 1 else "records are"
+                st.caption(
+                    f"{outlier_count:,} high-value {noun} drawn at the 95th percentile for readability; "
+                    "the figures above use the real values."
+                )
 
-        if not insight_items:
-            insight_items = [
-                "Add at least one numeric measure and one category field to unlock richer automatic insights."
-            ]
+        with count_panel, st.container(border=True, height="stretch"):
+            group_col = district_col if district_col and selected_district == "All" else None
+            group_col = group_col or pick_category_column(
+                filtered_df,
+                exclude=[focus_col],
+                preferred_tokens=["district", "region", "state", "country", "crop", "type", "category", "indicator"],
+            )
+            if group_col:
+                group_label = pretty_column_label(group_col)
+                limit = int(settings.get("top_regions_limit", 10))
+                counts = (
+                    filtered_df[group_col].astype(str).str.strip().value_counts().head(limit)
+                    .rename("value").rename_axis("category").reset_index()
+                )
+                st.markdown(f"**Records by {lower_first(group_label)}**")
+                st.altair_chart(ranked_bar_chart(counts, group_label, "Records", ","), width="stretch")
+                st.caption(f"Top {len(counts)} shown.")
+            else:
+                st.markdown("**Records by group**")
+                st.caption("No suitable grouping field detected for this dataset.")
 
-        for item in insight_items:
-            st.write(f"- {item}")
+    # --- Data checks -----------------------------------------------------------
+    diff = data_diff_summary()
+    # The diff compares the pipeline's raw and cleaned files; it says nothing about an
+    # upload being explored, so hide it rather than show unrelated numbers.
+    show_diff = bool(settings.get("show_data_diff", True) and diff and session_upload() is None)
+
+    st.subheader("Data checks")
+    st.caption("Whether the dataset has the fields the dashboard relies on, and what the cleaning step changed.")
+    tab_labels = ["Field coverage"] + (["Raw to clean changes"] if show_diff else [])
+    tabs = st.tabs(tab_labels)
+    with tabs[0]:
+        st.dataframe(pd.DataFrame(data_contract_check(active_df)), width="stretch", hide_index=True)
+    if show_diff:
+        with tabs[1]:
+            d1, d2, d3 = st.columns(3, gap="small")
+            with d1:
+                kpi_card("Raw columns", str(diff["raw_cols"]), f"{format_num(diff['raw_shape'][0], 0)} rows")
+            with d2:
+                kpi_card("Clean columns", str(diff["clean_cols"]), f"{format_num(diff['clean_shape'][0], 0)} rows")
+            with d3:
+                kpi_card("Prediction columns", str(len(diff["added_by_prediction"])), "Added by the model")
+
+            with st.expander("Field-level changes", icon=":material/difference:"):
+                st.markdown(
+                    f"- Renamed during normalisation: {len(diff['renamed_pairs'])}\n"
+                    f"- Removed by cleaning: {len(diff['removed_after_clean'])}\n"
+                    f"- Added by prediction: {len(diff['added_by_prediction'])}"
+                )
+                if diff["renamed_pairs"]:
+                    st.markdown("**Renamed fields**")
+                    st.dataframe(
+                        pd.DataFrame(diff["renamed_pairs"]).head(25),
+                        width="stretch",
+                        hide_index=True,
+                        column_config={"from": "Original name", "to": "Normalised name"},
+                    )
+                if diff["removed_after_clean"]:
+                    st.markdown("**Removed by cleaning**")
+                    st.dataframe(
+                        pd.DataFrame({"Column": diff["removed_after_clean"]}).head(25),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                if diff["added_by_prediction"]:
+                    st.markdown("**Prediction output columns**")
+                    st.dataframe(
+                        pd.DataFrame({"Column": diff["added_by_prediction"]}),
+                        width="stretch",
+                        hide_index=True,
+                    )
 
 
 # -----------------------------------------------------------------------------
 # Page: Model Performance
 # -----------------------------------------------------------------------------
-elif page == "Model Performance":
+def page_model_performance() -> None:
     settings = app_settings()
     metrics = load_metrics(str(settings["metrics_path"]))
     preds = load_csv(str(settings["predictions_path"]))
     model_skipped = bool(metrics and str(metrics.get("status", "")).lower() == "skipped")
 
-    model_header_chips: list[tuple[str, str]] = [("Pipeline", last_run_badge().replace("Last Run: ", ""))]
+    chips: list[tuple[str, str]] = []
     if metrics:
-        target_value = metrics.get("target")
-        if target_value:
-            model_header_chips.insert(0, ("Target", pretty_column_label(str(target_value))))
-        if not model_skipped and metrics.get("n_train") is not None:
-            model_header_chips.append(("Training rows", format_num(metrics.get("n_train"), 0)))
-        if not model_skipped and metrics.get("model_type"):
-            model_header_chips.append(("Model", model_display_label(metrics.get("model_type"))))
+        if metrics.get("target"):
+            chips.append(("Target", pretty_column_label(str(metrics.get("target")))))
         if model_skipped:
-            model_header_chips.append(("Status", "Training skipped"))
+            chips.append(("Status", "Training skipped"))
         else:
-            readiness_label, _ = model_readiness_message(metrics)
-            model_header_chips.append(("Readiness", readiness_label))
+            if metrics.get("model_type"):
+                chips.append(("Model", model_display_label(metrics.get("model_type"))))
+            chips.append(("Verdict", model_readiness_message(metrics)[0]))
     else:
-        model_header_chips.insert(0, ("Model", "Artifacts not found"))
+        chips.append(("Model", "Missing"))
+    chips.append(("Pipeline run", last_run_label()))
 
     render_page_header(
-        "Model Performance",
-        "Track the current model's error profile, sample size, and prediction behavior with the same executive-style framing used on the dashboard.",
-        chips=model_header_chips,
-        eyebrow="Model intelligence",
+        "Model performance",
+        "How far off the yield forecasts are, what they are compared against, and how "
+        "predictions line up with what actually happened.",
+        chips=chips,
+        eyebrow="Forecasting",
     )
     st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
 
-    if metrics:
-        if model_skipped:
-            reason = str(metrics.get("reason", "Target column was unavailable for model training."))
-            st.warning(f"Model training skipped for the latest pipeline run. {reason}")
-            rows = metrics.get("n_rows")
-            cols = metrics.get("n_columns")
-            used_features = metrics.get("n_features")
-            detail_parts: list[str] = []
-            if rows is not None:
-                detail_parts.append(f"rows: {rows}")
-            if cols is not None:
-                detail_parts.append(f"columns: {cols}")
-            if used_features is not None:
-                detail_parts.append(f"features used for transform: {used_features}")
-            if detail_parts:
-                st.caption(" | ".join(detail_parts))
-            st.caption("Set a valid target in the Uploads page to train and generate fresh predictions.")
-        else:
-            label_map = {
-                "rmse": ("Typical error (tons)", "Large misses weigh more; lower is better"),
-                "mae": ("Average error (tons)", "Average prediction miss; lower is better"),
-                "n_train": ("Records used to learn", "Training examples"),
-                "n_test": ("Records used to check", "Validation examples"),
-                "test_size": ("Test share", "Fraction held out for checking"),
-                "target": ("Prediction target", "What the model predicts"),
-            }
-            metric_icon_map = {
-                "rmse": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M13 2 3 14h7l-1 8 10-12h-7z"/></svg>',
-                "mae": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 3a9 9 0 1 0 9 9 9 9 0 0 0-9-9zm1 13h-2v-2h2zm0-4h-2V7h2z"/></svg>',
-                "n_train": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M16 11a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm8 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4zm-8 1c-2.33 0-7 1.17-7 3.5V19h7v-1.5A4.68 4.68 0 0 1 10 14.6 8.55 8.55 0 0 0 8 14z"/></svg>',
-                "n_test": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 4h16v2H4zm0 5h16v2H4zm0 5h10v2H4zm0 5h10v2H4z"/></svg>',
-                "test_size": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M5 3h14a2 2 0 0 1 2 2v14l-4-3-4 3-4-3-4 3V5a2 2 0 0 1 2-2z"/></svg>',
-                "target": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 14a4 4 0 1 1 4-4 4 4 0 0 1-4 4zm0-6a2 2 0 1 0 2 2 2 2 0 0 0-2-2z"/></svg>',
-            }
-            metric_color_map = {
-                "rmse": "#f39a58",
-                "mae": "#f7b267",
-                "n_train": "#52d273",
-                "n_test": "#49a9f1",
-                "test_size": "#8479ff",
-                "target": "#d26cf3",
-            }
-            preferred_keys = ["rmse", "mae", "n_train", "n_test", "test_size", "target"]
-            metric_keys = [k for k in preferred_keys if k in metrics]
-            if not metric_keys:
-                metric_keys = list(metrics.keys())
-            top_keys = metric_keys[:4]
-            if len(top_keys) >= 3:
-                row_one = top_keys[:2]
-                row_two = top_keys[2:4]
-                cols_row_one = st.columns(2, gap="small")
-                for i, key in enumerate(row_one):
-                    with cols_row_one[i]:
-                        label, note = label_map.get(key, (key.upper(), ""))
-                        kpi_card(label, format_num(metrics.get(key), 3), note, metric_icon_map.get(key, ""), metric_color_map.get(key, ""))
-                if row_two:
-                    st.markdown('<div class="kpi-row-gap"></div>', unsafe_allow_html=True)
-                    cols_row_two = st.columns(2, gap="small")
-                    for i, key in enumerate(row_two):
-                        with cols_row_two[i]:
-                            label, note = label_map.get(key, (key.upper(), ""))
-                            kpi_card(label, format_num(metrics.get(key), 3), note, metric_icon_map.get(key, ""), metric_color_map.get(key, ""))
-            else:
-                cols = st.columns(max(1, len(top_keys)), gap="small")
-                for i, key in enumerate(top_keys):
-                    with cols[i]:
-                        label, note = label_map.get(key, (key.upper(), ""))
-                        kpi_card(label, format_num(metrics.get(key), 3), note, metric_icon_map.get(key, ""), metric_color_map.get(key, ""))
-            st.markdown('<div class="kpi-row-gap"></div>', unsafe_allow_html=True)
+    if session_upload() is not None:
+        retrain_hint = (
+            "Retraining is turned off on this shared demo; run the app locally to train on your data."
+            if is_demo_mode()
+            else "Run the pipeline from the Uploads page to train on your data."
+        )
+        st.info(
+            "This page describes the model trained on the demo dataset, not your upload. " + retrain_hint,
+            icon=":material/info:",
+        )
 
-            readiness_label, readiness_text = model_readiness_message(metrics)
-            st.info(f"Model status: {readiness_label}. {readiness_text}")
-            model_type = model_display_label(metrics.get("model_type"))
-            baseline_metrics = metrics.get("baseline_metrics") if isinstance(metrics.get("baseline_metrics"), dict) else {}
-            dataset_profile = metrics.get("dataset_profile") if isinstance(metrics.get("dataset_profile"), dict) else {}
-            if model_type != "Model" or baseline_metrics or dataset_profile:
-                model_diag_cols = st.columns(3, gap="medium")
-                with model_diag_cols[0]:
-                    kpi_card(
-                        "Selected Model",
-                        model_type,
-                        "Chosen from candidate training",
-                        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 4h16v4H4zm0 6h7v10H4zm9 0h7v10h-7z"/></svg>',
-                        "#52d273",
-                    )
-                with model_diag_cols[1]:
-                    baseline_mae = baseline_metrics.get("mae") if baseline_metrics else None
-                    kpi_card(
-                        "Baseline MAE",
-                        format_num(baseline_mae, 3),
-                        "Median predictor benchmark",
-                        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 11h18v2H3zm4-6h10v2H7zm0 12h10v2H7z"/></svg>',
-                        "#f7b267",
-                    )
-                with model_diag_cols[2]:
-                    encoded_features = dataset_profile.get("estimated_encoded_features") if dataset_profile else None
-                    kpi_card(
-                        "Encoded Features",
-                        format_num(encoded_features, 0),
-                        "Estimated after preprocessing",
-                        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 5h16v2H4zm0 6h16v2H4zm0 6h10v2H4z"/></svg>',
-                        "#49a9f1",
-                    )
-            profile_warnings = dataset_profile.get("warnings", []) if dataset_profile else []
-            if profile_warnings:
-                st.warning(" ".join(str(item) for item in profile_warnings))
-            candidate_metrics = metrics.get("candidate_metrics")
-            if isinstance(candidate_metrics, dict) and candidate_metrics:
-                with st.expander("Model Candidate Comparison", expanded=False):
-                    comparison_rows = []
-                    for candidate_name, values in candidate_metrics.items():
-                        if isinstance(values, dict):
-                            comparison_rows.append(
-                                {
-                                    "Model": model_display_label(candidate_name),
-                                    "MAE": values.get("mae"),
-                                    "RMSE": values.get("rmse"),
-                                    "R2": values.get("r2"),
-                                }
-                            )
-                    if baseline_metrics:
-                        comparison_rows.append(
-                            {
-                                "Model": "Median baseline",
-                                "MAE": baseline_metrics.get("mae"),
-                                "RMSE": baseline_metrics.get("rmse"),
-                                "R2": baseline_metrics.get("r2"),
-                            }
-                        )
-                    st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
-            st.caption(
-                "Plain-language guide: if error numbers go down over time while records used to learn go up, your model is becoming more trustworthy."
-            )
+    if not metrics:
+        st.info(
+            "No model metrics yet. Run `python scripts/run_pipeline.py` to train a model.",
+            icon=":material/model_training:",
+        )
+    elif model_skipped:
+        reason = str(metrics.get("reason", "Target column was unavailable for model training."))
+        st.warning(f"Model training was skipped in the latest pipeline run. {reason}", icon=":material/warning:")
+        detail_parts = [
+            f"{name}: {format_num(metrics.get(key), 0)}"
+            for key, name in [("n_rows", "Rows"), ("n_columns", "Columns"), ("n_features", "Features transformed")]
+            if metrics.get(key) is not None
+        ]
+        if detail_parts:
+            st.caption(" · ".join(detail_parts))
+        st.caption("Choose a valid target on the Uploads page to train and generate fresh predictions.")
     else:
-        st.info("Model metrics not found yet. Run `python scripts/train_model.py`.")
+        error_unit = measure_unit(metrics.get("target")) or "target units"
+        kpi_specs = [
+            ("mae", f"Average error ({error_unit})", "Mean absolute miss; lower is better", "error", "#f7b267", 1),
+            ("rmse", f"Typical error ({error_unit})", "Root mean square; large misses weigh more", "spike", "#f39a58", 1),
+            ("n_train", "Training records", "Examples the model learned from", "people", "#52d273", 0),
+            ("n_test", "Test records", "Held out to check the model", "list", "#49a9f1", 0),
+        ]
+        kpi_cols = st.columns(4, gap="small")
+        for col, (key, label, note, icon, color, digits) in zip(kpi_cols, kpi_specs):
+            with col:
+                kpi_card(label, format_num(metrics.get(key), digits), note, KPI_ICONS[icon], color)
+        if metrics.get("test_size") is not None:
+            st.caption(
+                f"Headline figures come from a random {float(metrics['test_size']):.0%} hold-out. "
+                "The forward-looking check below is the stricter test."
+            )
 
-    with st.expander("Model Configuration", expanded=False):
-        model_config_name = model_display_label(metrics.get("model_type")) if metrics and not model_skipped else "Random Forest"
+        verdict, verdict_text = model_readiness_message(metrics)
+        st.info(f"**{verdict}.** {verdict_text}", icon=":material/insights:")
+
+        render_forward_looking_evaluation(metrics)
+
+        baseline_metrics = metrics.get("baseline_metrics") if isinstance(metrics.get("baseline_metrics"), dict) else {}
+        dataset_profile = metrics.get("dataset_profile") if isinstance(metrics.get("dataset_profile"), dict) else {}
+        st.subheader("Model details")
+        diag_cols = st.columns(3, gap="small")
+        with diag_cols[0]:
+            kpi_card(
+                "Selected model",
+                model_display_label(metrics.get("model_type")),
+                "Best of the candidates trained",
+                KPI_ICONS["model"],
+                "#52d273",
+            )
+        with diag_cols[1]:
+            kpi_card(
+                f"Median baseline error ({error_unit})",
+                format_num(baseline_metrics.get("mae"), 1),
+                "Always predicting the median",
+                KPI_ICONS["baseline"],
+                "#f7b267",
+            )
+        with diag_cols[2]:
+            kpi_card(
+                "Encoded features",
+                format_num(dataset_profile.get("estimated_encoded_features"), 0),
+                "Inputs after preprocessing",
+                KPI_ICONS["features"],
+                "#49a9f1",
+            )
+        for warning in dataset_profile.get("warnings", []):
+            st.caption(f":material/warning: {warning}")
+
+        candidate_metrics = metrics.get("candidate_metrics")
+        if isinstance(candidate_metrics, dict) and candidate_metrics:
+            with st.expander("Candidate comparison", icon=":material/leaderboard:"):
+                comparison_rows = [
+                    {
+                        "Model": model_display_label(name),
+                        "MAE": values.get("mae"),
+                        "RMSE": values.get("rmse"),
+                        "R²": values.get("r2"),
+                    }
+                    for name, values in candidate_metrics.items()
+                    if isinstance(values, dict)
+                ]
+                if baseline_metrics:
+                    comparison_rows.append(
+                        {
+                            "Model": "Median baseline",
+                            "MAE": baseline_metrics.get("mae"),
+                            "RMSE": baseline_metrics.get("rmse"),
+                            "R²": baseline_metrics.get("r2"),
+                        }
+                    )
+                st.dataframe(
+                    pd.DataFrame(comparison_rows),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "MAE": st.column_config.NumberColumn(format="%.1f"),
+                        "RMSE": st.column_config.NumberColumn(format="%.1f"),
+                        "R²": st.column_config.NumberColumn(format="%.3f"),
+                    },
+                )
+
+    with st.expander("Model configuration", icon=":material/settings:"):
+        model_config_name = model_display_label(metrics.get("model_type")) if metrics and not model_skipped else "Random forest"
         encoder_config = metrics.get("encoder") if isinstance(metrics, dict) and isinstance(metrics.get("encoder"), dict) else {}
         st.code(
             f"""
@@ -4157,195 +2909,284 @@ Preprocessing:
 - Category cap: max_categories={encoder_config.get("max_categories")}
 - Numeric: median imputation after numeric coercion
             """.strip(),
-            language="python",
+            language="text",
         )
 
+    st.subheader("Predictions")
     if model_skipped:
-        st.info("No new predictions were generated in the latest run because model training was skipped.")
-        if preds is not None and not preds.empty:
-            st.caption("Showing latest available predictions file, which may come from an earlier run.")
-
+        st.caption("The latest run generated no new predictions because training was skipped.")
     if preds is None or preds.empty:
-        st.warning("No predictions available. Run `python scripts/predict.py`.")
-    else:
-        st.markdown('<div class="panel"><h4>Prediction Sample</h4></div>', unsafe_allow_html=True)
-        st.dataframe(preds.head(15), width="stretch")
+        st.info("No predictions available yet. Run `python scripts/predict.py`.", icon=":material/info:")
+        return
 
-        actual_col = pick_column(preds, ["actual", "actual_yield", "yield_tons"])
-        pred_col = pick_column(preds, ["prediction", "predicted", "predicted_yield"])
-        if actual_col and pred_col:
-            st.markdown('<div class="panel"><h4>Predicted vs Actual</h4></div>', unsafe_allow_html=True)
-            fig, ax = plt.subplots(figsize=(7.4, 4.2))
-            fig.patch.set_facecolor(PAGE_CANVAS)
-            ax.scatter(preds[actual_col], preds[pred_col], alpha=0.55, color="#2b8a4b")
-            lo = min(preds[actual_col].min(), preds[pred_col].min())
-            hi = max(preds[actual_col].max(), preds[pred_col].max())
-            ax.plot([lo, hi], [lo, hi], linestyle="--", color="#9c2f2f", linewidth=1)
-            ax.set_xlabel("Actual")
-            ax.set_ylabel("Predicted")
-            style_chart_axes(ax, dark=IS_DARK_THEME)
-            ax.grid(alpha=0.22)
-            fig.tight_layout()
-            st.pyplot(fig, width="stretch")
+    # predict.py names its output "predicted_<target>", and the target changes with the
+    # dataset, so neither column can be found from a fixed list of names. Resolve the
+    # actual column from the trained target and pair it with the matching prediction.
+    trained_target = str(metrics.get("target")) if isinstance(metrics, dict) else ""
+    actual_col = pick_column(preds, [trained_target, "actual", "actual_yield", "yield_tons"])
+    pred_col = pick_column(preds, [f"predicted_{trained_target}", "prediction", "predicted", "predicted_yield"])
+    if pred_col is None:
+        pred_col = next((c for c in preds.columns if str(c).lower().startswith("predicted")), None)
+
+    if actual_col and pred_col:
+        pairs = pd.DataFrame(
+            {
+                "actual": pd.to_numeric(preds[actual_col], errors="coerce"),
+                "predicted": pd.to_numeric(preds[pred_col], errors="coerce"),
+            }
+        ).dropna()
+        for label_col in ("country", "crop", "year"):
+            if label_col in preds.columns:
+                pairs[label_col] = preds.loc[pairs.index, label_col]
+        # Thousands of overlapping points add nothing but render time.
+        sample = pairs.sample(min(len(pairs), 4000), random_state=7) if len(pairs) > 4000 else pairs
+        unit = measure_unit(actual_col)
+        unit_suffix = f" ({unit})" if unit else ""
+        lo = float(min(sample["actual"].min(), sample["predicted"].min()))
+        hi = float(max(sample["actual"].max(), sample["predicted"].max()))
+
+        with st.container(border=True):
+            st.markdown("**Predicted against actual**")
+            tooltip = [
+                alt.Tooltip(c, title=c.capitalize())
+                for c in ("country", "crop", "year")
+                if c in sample.columns
+            ] + [
+                alt.Tooltip("actual:Q", title=f"Actual{unit_suffix}", format=",.0f"),
+                alt.Tooltip("predicted:Q", title=f"Predicted{unit_suffix}", format=",.0f"),
+            ]
+            points = (
+                alt.Chart(sample)
+                .mark_circle(size=22, opacity=0.45, color=SERIES_PALETTE[0])
+                .encode(
+                    x=alt.X("actual:Q", title=f"Actual{unit_suffix}", scale=alt.Scale(domain=[lo, hi])),
+                    y=alt.Y("predicted:Q", title=f"Predicted{unit_suffix}", scale=alt.Scale(domain=[lo, hi])),
+                    tooltip=tooltip,
+                )
+            )
+            diagonal = (
+                alt.Chart(pd.DataFrame({"actual": [lo, hi], "predicted": [lo, hi]}))
+                .mark_line(color=AXIS_INK, strokeDash=[6, 4], strokeWidth=1.5)
+                .encode(x="actual:Q", y="predicted:Q")
+            )
+            st.altair_chart(
+                (points + diagonal)
+                .properties(height=420)
+                .configure_view(stroke=None)
+                .configure_axis(gridOpacity=0.18, labelColor=AXIS_INK, titleColor=AXIS_INK),
+                width="stretch",
+            )
+            sampled_note = f" A random {len(sample):,} of {len(pairs):,} are drawn." if len(sample) < len(pairs) else ""
+            st.caption(
+                f"Points on the dashed line were predicted exactly; distance from it is the error.{sampled_note}"
+            )
+
+    with st.expander("Prediction sample", icon=":material/table_rows:"):
+        st.dataframe(preds.head(15), width="stretch", hide_index=True)
 
 
 # -----------------------------------------------------------------------------
 # Page: Data Explorer
 # -----------------------------------------------------------------------------
-elif page == "Data Explorer":
+def render_dataset_view(df: pd.DataFrame, file_name: str, key: str, noun: str = "columns") -> None:
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.caption(f"{df.shape[0]:,} rows · {df.shape[1]:,} {noun}")
+        st.space("stretch")
+        st.download_button(
+            "Download CSV",
+            df.to_csv(index=False).encode("utf-8"),
+            file_name=file_name,
+            mime="text/csv",
+            key=key,
+            icon=":material/download:",
+        )
+    st.dataframe(df, width="stretch", height=440)
+
+
+def page_data_explorer() -> None:
     settings = app_settings()
-    explorer_chips = [
-        ("Raw", "Available" if Path(str(settings["raw_data_path"])).exists() or Path(str(settings["raw_fallback_path"])).exists() else "Missing"),
-        ("Clean", "Available" if Path(str(settings["clean_data_path"])).exists() else "Missing"),
-        ("Features", "Available" if Path(str(settings["features_data_path"])).exists() else "Missing"),
-    ]
+    raw_exists = Path(str(settings["raw_data_path"])).exists() or Path(str(settings["raw_fallback_path"])).exists()
     render_page_header(
-        "Data Explorer",
-        "Inspect raw, cleaned, and engineered datasets with the same polished shell used across the rest of the app.",
-        chips=explorer_chips,
+        "Data explorer",
+        "Browse and download each stage of the data: the raw source, the cleaned table, and the "
+        "engineered features the model trains on.",
+        chips=[
+            ("Raw", "Available" if raw_exists else "Missing"),
+            ("Clean", "Available" if Path(str(settings["clean_data_path"])).exists() else "Missing"),
+            ("Features", "Available" if Path(str(settings["features_data_path"])).exists() else "Missing"),
+        ],
         eyebrow="Data inspection",
     )
     st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
 
-    tab1, tab2, tab3 = st.tabs(["Raw Data", "Cleaned Data", "Features"])
+    explorer_upload = session_upload()
+    tab_labels = ["Raw data", "Cleaned data", "Features"]
+    if explorer_upload is not None:
+        st.info(
+            upload_privacy_note(explorer_upload)
+            + " The other tabs show the demo pipeline's files, which your upload does not change.",
+            icon=":material/lock:",
+        )
+        tabs = st.tabs(["Your upload"] + [f"Demo {lower_first(label)}" for label in tab_labels])
+        with tabs[0]:
+            upload_raw = explorer_upload["raw"]
+            render_dataset_view(upload_raw, explorer_upload["name"], "dl_upload")
+            with st.expander("Column profile", icon=":material/view_column:"):
+                st.dataframe(
+                    pd.DataFrame(
+                        {
+                            "Column": upload_raw.columns.astype(str),
+                            "Type": upload_raw.dtypes.astype(str).to_numpy(),
+                            "Non-empty": upload_raw.notna().sum().to_numpy(),
+                            "Missing %": (upload_raw.isna().mean() * 100).round(1).to_numpy(),
+                            "Distinct": upload_raw.nunique(dropna=True).to_numpy(),
+                        }
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Missing %": st.column_config.ProgressColumn(
+                            "Missing", format="%.1f%%", min_value=0, max_value=100
+                        ),
+                    },
+                )
+        raw_tab, clean_tab, features_tab = tabs[1:]
+    else:
+        raw_tab, clean_tab, features_tab = st.tabs(tab_labels)
 
-    with tab1:
+    with raw_tab:
         raw = load_csv(str(settings["raw_data_path"]))
         if raw is None:
             raw = load_csv(str(settings["raw_fallback_path"]))
         if raw is None:
-            st.warning(
-                f"No raw data found at `{settings['raw_data_path']}` or `{settings['raw_fallback_path']}`."
-                " Upload a CSV on the Uploads page to get started."
+            st.info(
+                f"No raw data found at `{settings['raw_data_path']}` or `{settings['raw_fallback_path']}`. "
+                "Upload a CSV on the Uploads page to get started.",
+                icon=":material/database:",
             )
         else:
-            dl_col, cap_col = st.columns([1, 4])
-            with cap_col:
-                st.caption(f"Rows: {raw.shape[0]} | Columns: {raw.shape[1]}")
-            with dl_col:
-                st.download_button(
-                    "Download CSV",
-                    raw.to_csv(index=False).encode("utf-8"),
-                    file_name="raw_data.csv",
-                    mime="text/csv",
-                    key="dl_raw",
-                )
-            st.dataframe(raw, width="stretch", height=420)
+            render_dataset_view(raw, "raw_data.csv", "dl_raw")
 
-    with tab2:
+    with clean_tab:
         clean = load_csv(str(settings["clean_data_path"]))
         if clean is None:
-            st.warning(
-                f"No cleaned data found at `{settings['clean_data_path']}`."
-                " Run the pipeline on the Uploads page to generate it."
+            st.info(
+                f"No cleaned data found at `{settings['clean_data_path']}`. Run the pipeline to generate it.",
+                icon=":material/database:",
             )
         else:
-            dl_col, cap_col = st.columns([1, 4])
-            with cap_col:
-                st.caption(f"Rows: {clean.shape[0]} | Columns: {clean.shape[1]}")
-            with dl_col:
-                st.download_button(
-                    "Download CSV",
-                    clean.to_csv(index=False).encode("utf-8"),
-                    file_name="clean_data.csv",
-                    mime="text/csv",
-                    key="dl_clean",
-                )
-            st.dataframe(clean, width="stretch", height=420)
+            render_dataset_view(clean, "clean_data.csv", "dl_clean")
 
-    with tab3:
+    with features_tab:
         features = load_csv(str(settings["features_data_path"]))
         if features is None:
-            st.warning(
-                f"No feature set found at `{settings['features_data_path']}`."
-                " Run the pipeline on the Uploads page to generate it."
+            st.info(
+                f"No feature set found at `{settings['features_data_path']}`. Run the pipeline to generate it.",
+                icon=":material/database:",
             )
         else:
-            dl_col, cap_col = st.columns([1, 4])
-            with cap_col:
-                st.caption(f"Rows: {features.shape[0]} | Features: {features.shape[1]}")
-            with dl_col:
-                st.download_button(
-                    "Download CSV",
-                    features.to_csv(index=False).encode("utf-8"),
-                    file_name="features.csv",
-                    mime="text/csv",
-                    key="dl_features",
-                )
-            st.dataframe(features, width="stretch", height=420)
+            render_dataset_view(features, "features.csv", "dl_features", noun="features")
 
 
 # -----------------------------------------------------------------------------
 # Page: Uploads
 # -----------------------------------------------------------------------------
-elif page == "Uploads":
+def step_heading(step: str, title: str, note: str, compact: bool = False) -> None:
+    extra = " compact" if compact else ""
+    st.markdown(
+        f'<div class="upload-panel-heading{extra}">'
+        f'<div class="upload-panel-step">{html.escape(step)}</div>'
+        f'<div><div class="upload-panel-title">{html.escape(title)}</div>'
+        f'<div class="upload-panel-note">{html.escape(note)}</div></div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def page_uploads() -> None:
     settings = app_settings()
-    upload_header_chips = [
-        ("Pipeline", last_run_badge().replace("Last Run: ", "")),
-        ("Input path", Path(str(settings["raw_fallback_path"])).name or str(settings["raw_fallback_path"])),
-    ]
+    upload_header_chips = [("Pipeline run", last_run_label())]
+    if not is_demo_mode():
+        upload_header_chips.append(
+            ("Input file", Path(str(settings["raw_fallback_path"])).name or str(settings["raw_fallback_path"]))
+        )
     render_page_header(
-        "Uploads & Pipeline",
-        "Bring in a new CSV, preview what the app can already infer from it, and run the full pipeline without leaving the browser.",
+        "Uploads",
+        "Bring in your own CSV and explore it across every page. The file stays in your browser "
+        "session and is never saved unless you choose to.",
         chips=upload_header_chips,
         eyebrow="Data onboarding",
     )
     st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
 
+    if is_demo_mode():
+        st.info(DEMO_NOTICE, icon=":material/visibility:")
+
     pipeline_feedback = st.session_state.pop("pipeline_run_feedback", None)
     if pipeline_feedback:
-        st.success(pipeline_feedback)
+        st.success(pipeline_feedback, icon=":material/check_circle:")
     pipeline_output = st.session_state.get("pipeline_run_output")
     if pipeline_output:
-        with st.expander("Last Pipeline Log", expanded=False):
+        with st.expander("Last pipeline log", icon=":material/terminal:"):
             st.code(pipeline_output, language="text")
-
-    st.markdown(
-        """
-        <div class="upload-section-heading">
-            <h2>Upload a New Dataset</h2>
-            <p>Choose a CSV, confirm the target field, and refresh the analytics data from one place.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
     preview_df: pd.DataFrame | None = None
     inferred_target: str | None = None
     auto_detect_target = True
     with st.container(border=True):
-        st.markdown(
-            """
-            <div class="upload-panel-heading">
-                <div class="upload-panel-step">Step 1</div>
-                <div>
-                    <div class="upload-panel-title">Source Configuration</div>
-                    <div class="upload-panel-note">Set the CSV path and target detection before starting a run.</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        step_heading("Step 1", "Choose a file", "Upload a CSV, or point the pipeline at a file already on the server.")
         st.markdown('<div class="upload-subsection-label">File source</div>', unsafe_allow_html=True)
         source_file_col, source_path_col = st.columns([1.15, 0.85], gap="large", vertical_alignment="top")
         with source_file_col:
             uploaded_csv = st.file_uploader(
-                "Upload CSV",
+                "CSV file",
                 type=["csv"],
                 accept_multiple_files=False,
-                help="Upload any CSV and save it to the pipeline input path.",
+                key=upload_widget_key(),
+                help=(
+                    "The file is read into your browser session only. Every page switches "
+                    "to it until you choose 'Back to demo data'."
+                ),
             )
         with source_path_col:
             pipeline_input_path = st.text_input(
-                "Pipeline Input CSV Path",
+                "Pipeline input path",
                 value=str(settings["raw_fallback_path"]),
-                help="This file is used as `--input` for `scripts/run_pipeline.py`.",
+                disabled=is_demo_mode(),
+                help="Passed as `--input` to `scripts/run_pipeline.py`.",
             )
 
-        preview_df = load_csv(pipeline_input_path.strip())
+        # Removing the file from the widget does not drop the session copy: the widget is
+        # also empty whenever this page is re-rendered after visiting another page, and
+        # that must not silently switch the visitor back to the demo data.
+        if uploaded_csv is not None:
+            upload_error = ingest_session_upload(uploaded_csv)
+            if upload_error:
+                st.error(upload_error)
+
+        active_upload = session_upload()
+        if active_upload is not None:
+            note_col, action_col = st.columns([3, 1], gap="medium", vertical_alignment="center")
+            with note_col:
+                st.success(upload_privacy_note(active_upload), icon=":material/lock:")
+            with action_col:
+                if st.button(
+                    "Open dashboard",
+                    key="upload_open_dashboard",
+                    icon=":material/space_dashboard:",
+                    type="primary",
+                    width="stretch",
+                ):
+                    st.switch_page(DASHBOARD_PAGE)
+                if st.button("Back to demo data", key="upload_clear", icon=":material/undo:", width="stretch"):
+                    clear_session_upload()
+                    st.rerun()
+            preview_df = active_upload["frame"]
+        else:
+            preview_df = load_csv(pipeline_input_path.strip())
         inferred_target = infer_target_column(preview_df)
 
-        st.markdown('<div class="upload-subsection-label">Target settings</div>', unsafe_allow_html=True)
+        st.markdown('<div class="upload-subsection-label">Training target</div>', unsafe_allow_html=True)
         target_col, save_setting_col = st.columns([1.22, 0.78], gap="large", vertical_alignment="top")
         with target_col:
             auto_detect_target = st.toggle(
@@ -4368,41 +3209,41 @@ elif page == "Uploads":
                             ordered_columns.append(col_name)
                     default_target = inferred_target if inferred_target in ordered_columns else ordered_columns[0]
                     pipeline_target_column = st.selectbox(
-                        "Pipeline Target Column",
+                        "Target column",
                         options=ordered_columns,
                         index=ordered_columns.index(default_target),
                         help="Choose the exact target column to train on.",
                     )
                 else:
                     pipeline_target_column = st.text_input(
-                        "Pipeline Target Column",
+                        "Target column",
                         value=inferred_target or "yield_tons",
                         help="Set the regression target for training (for example: `yield_tons`, `price`, or `value`).",
                     )
         with save_setting_col:
             update_fallback_setting = st.toggle(
-                "Update saved raw path",
+                "Remember this input path",
                 value=True,
                 help="When enabled, Settings will remember this input path as the fallback raw data path.",
             )
-            st.caption("Keep this on when this CSV should become the default upload source.")
+            st.caption("Saves the path as the fallback raw data path in Settings.")
 
         st.markdown('<div class="upload-panel-divider"></div>', unsafe_allow_html=True)
-        st.markdown(
-            """
-            <div class="upload-panel-heading compact">
-                <div class="upload-panel-step">Step 2</div>
-                <div>
-                    <div class="upload-panel-title">Pipeline Actions</div>
-                    <div class="upload-panel-note">Save the file for review, or run the full refresh when the source looks right.</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        step_heading(
+            "Step 2",
+            "Run the pipeline",
+            "Save the file for review, or clean, featurise and retrain in one go.",
+            compact=True,
         )
         upload_col, run_col = st.columns(2, gap="medium")
         with upload_col:
-            if st.button("Save Uploaded CSV", width="stretch"):
+            if st.button(
+                "Save uploaded CSV",
+                icon=":material/save:",
+                width="stretch",
+                disabled=is_demo_mode(),
+                help="Disabled on the shared demo." if is_demo_mode() else None,
+            ) and guard_write_action("Saving an upload"):
                 saved_ok, saved_msg = save_uploaded_csv(uploaded_csv, pipeline_input_path.strip())
                 if saved_ok:
                     if update_fallback_setting:
@@ -4410,12 +3251,24 @@ elif page == "Uploads":
                         updated_settings["raw_fallback_path"] = pipeline_input_path.strip()
                         st.session_state["app_settings"] = updated_settings
                         save_app_settings(updated_settings)
-                    st.success(saved_msg)
+                    st.success(saved_msg, icon=":material/check_circle:")
                 else:
-                    st.error(saved_msg)
+                    st.error(saved_msg, icon=":material/error:")
 
         with run_col:
-            if st.button("Run Pipeline Now", type="primary", width="stretch"):
+            if st.button(
+                "Run pipeline",
+                icon=":material/play_arrow:",
+                type="primary",
+                width="stretch",
+                disabled=is_demo_mode(),
+                help=(
+                    "Retraining replaces the model every visitor sees, so it is disabled on "
+                    "the shared demo. Run the app locally to train on your own data."
+                )
+                if is_demo_mode()
+                else None,
+            ) and guard_write_action("Running the pipeline"):
                 run_input_path = pipeline_input_path.strip()
 
                 if uploaded_csv is not None:
@@ -4429,7 +3282,7 @@ elif page == "Uploads":
                         st.session_state["app_settings"] = updated_settings
                         save_app_settings(updated_settings)
 
-                with st.spinner("Running pipeline. This can take a moment..."):
+                with st.spinner("Running the pipeline. This can take a minute..."):
                     run_ok, run_output = run_pipeline_for_input(
                         run_input_path,
                         pipeline_target_column,
@@ -4437,30 +3290,22 @@ elif page == "Uploads":
                     )
 
                 if run_ok:
+                    # The pipeline output now reflects this file; drop the session copy so
+                    # the dashboard shows the processed data rather than the raw upload.
+                    clear_session_upload()
                     st.session_state["pipeline_run_feedback"] = "Pipeline completed. Dashboard and explorer data have been refreshed."
                     st.session_state["pipeline_run_output"] = run_output
                     load_csv.clear()
                     load_metrics.clear()
                     st.rerun()
                 else:
-                    st.error("Pipeline run failed.")
+                    st.error("The pipeline run failed. The log is below.", icon=":material/error:")
                     if run_output:
                         st.code(run_output, language="text")
 
     st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
     with st.container(border=True):
-        st.markdown(
-            """
-            <div class="upload-panel-heading">
-                <div class="upload-panel-step">Status</div>
-                <div>
-                    <div class="upload-panel-title">Readiness Overview</div>
-                    <div class="upload-panel-note">A quick health check of the selected pipeline file.</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        step_heading("Check", "Readiness", "A quick health check of the selected file.")
         status, status_msg = target_health_message(
             preview_df,
             pipeline_target_column,
@@ -4468,24 +3313,23 @@ elif page == "Uploads":
             auto_detect=auto_detect_target,
         )
         if status == "good":
-            st.success(status_msg)
+            st.success(status_msg, icon=":material/check_circle:")
         elif status == "warn":
-            st.warning(status_msg)
+            st.warning(status_msg, icon=":material/warning:")
         else:
-            st.info(status_msg)
+            st.info(status_msg, icon=":material/info:")
 
-        summary_cols = st.columns(2, gap="medium")
-        with summary_cols[0]:
-            st.metric("Rows", format_num(preview_df.shape[0], 0) if preview_df is not None else "--")
-        with summary_cols[1]:
-            st.metric("Columns", format_num(preview_df.shape[1], 0) if preview_df is not None else "--")
+        with st.container(horizontal=True):
+            st.metric("Rows", format_num(preview_df.shape[0], 0) if preview_df is not None else "-", border=True)
+            st.metric("Columns", format_num(preview_df.shape[1], 0) if preview_df is not None else "-", border=True)
+            st.metric(
+                "Suggested target",
+                pretty_column_label(inferred_target) if inferred_target else "-",
+                border=True,
+            )
 
-        if preview_df is not None:
-            st.caption(f"Detected dataset at path: {Path(pipeline_input_path.strip()).name or pipeline_input_path.strip()}")
-            if inferred_target:
-                st.caption(f"Suggested target from schema scan: `{inferred_target}`")
-        else:
-            st.caption("No dataset detected at the current path yet.")
+        if preview_df is None:
+            st.caption("No dataset found yet. Upload a CSV above.")
 
     if preview_df is not None and not preview_df.empty:
         st.markdown('<div class="stack-gap"></div>', unsafe_allow_html=True)
@@ -4493,22 +3337,14 @@ elif page == "Uploads":
         readiness_score, readiness_band = dataset_readiness_score(preview_df, target_candidate=inferred_target)
         preview_insights = build_upload_preview_insights(preview_df, target_candidate=inferred_target)
 
-        st.markdown(
-            """
-            <div class="upload-section-heading secondary">
-                <div class="upload-section-kicker">Dataset preview</div>
-                <h2>Dataset Intelligence Preview</h2>
-                <p>Review readiness, target quality, and detected signals before using the data downstream.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.subheader("Dataset preview")
+        st.caption("Readiness, the likely training target, and the signals AgroSynapse found in this file.")
 
         preview_stat_cols = st.columns(3, gap="medium")
         with preview_stat_cols[0]:
             readiness_color = "#52d273" if readiness_score >= 75 else "#f7b267" if readiness_score >= 55 else "#f39a58"
             kpi_card(
-                "Readiness Score",
+                "Readiness score",
                 f"{readiness_score}/100",
                 readiness_band,
                 '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2 3 7v6c0 5 3.8 9.74 9 11 5.2-1.26 9-6 9-11V7zm0 2.18 7 3.11V13c0 4.07-2.83 7.92-7 9.06C7.83 20.92 5 17.07 5 13V7.29z"/></svg>',
@@ -4518,7 +3354,7 @@ elif page == "Uploads":
             target_display = pretty_column_label(preview_overview["target"]) if preview_overview["target"] else "Not detected"
             numeric_caption = f"{preview_overview['numeric_count']} numeric field(s)"
             kpi_card(
-                "Best Target Candidate",
+                "Best target candidate",
                 target_display,
                 numeric_caption,
                 '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 14a4 4 0 1 1 4-4 4 4 0 0 1-4 4zm0-6a2 2 0 1 0 2 2 2 2 0 0 0-2-2z"/></svg>',
@@ -4526,174 +3362,733 @@ elif page == "Uploads":
             )
         with preview_stat_cols[2]:
             kpi_card(
-                "Detected Signals",
-                f"{preview_overview['signals_count']} signals",
+                "Detected signals",
+                str(preview_overview["signals_count"]),
                 preview_overview["signals_label"],
                 '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M11 2v20a9 9 0 1 1 0-20zm2 0a9 9 0 0 1 0 20z"/></svg>',
                 "#8479ff",
             )
 
-        st.markdown('<div class="upload-preview-card-gap"></div>', unsafe_allow_html=True)
-        render_insight_cards(preview_insights, per_row=2, gap="large")
+        render_insight_cards(preview_insights, per_row=2)
 
-        with st.expander("Preview rows", expanded=False):
-            st.dataframe(preview_df.head(15), width="stretch")
+        with st.expander("First 15 rows", icon=":material/table_rows:"):
+            st.dataframe(preview_df.head(15), width="stretch", hide_index=True)
+
+
+# -----------------------------------------------------------------------------
+# Page: Crop Insights
+# -----------------------------------------------------------------------------
+def page_crop_insights() -> None:
+    insights_upload = session_upload()
+    insights_chips: list[tuple[str, str]] = [("Source", "Your upload" if insights_upload else "Demo panel")]
+    if active_df is not None and not active_df.empty:
+        insights_chips.append(("Records", format_num(len(active_df), 0)))
+    render_page_header(
+        "Crop insights",
+        "Compare crops and places, follow trends over time, and see where one country or region "
+        "stands against its peers. Every finding is computed from the data on screen.",
+        chips=insights_chips,
+        eyebrow="Descriptive analysis",
+    )
+    st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
+    if insights_upload is not None:
+        st.info(upload_privacy_note(insights_upload), icon=":material/lock:")
+
+    measure_options = (
+        candidate_numeric_columns(active_df, min_valid_ratio=0.3) if active_df is not None and not active_df.empty else []
+    )
+    measure_options = [c for c in measure_options if not is_risky_column(c)]
+    if not measure_options:
+        st.info(
+            "Load a dataset with at least one numeric column to analyse it. Use the Uploads page to add a CSV.",
+            icon=":material/database:",
+        )
+    else:
+        df_all = active_df
+        group_options = category_columns(df_all)
+        time_options = time_columns(df_all)
+        geo_default = geography_column(df_all)
+
+        default_measure = pick_column(df_all, ["yield_kg_per_ha"]) or infer_target_column(df_all) or measure_options[0]
+        default_group = pick_column(df_all, ["crop", "crop_type", "main_crop"])
+        if default_group not in group_options:
+            default_group = next((c for c in group_options if c != geo_default), None)
+
+        control_cols = st.columns(4, gap="small")
+        with control_cols[0]:
+            value_col = st.selectbox(
+                "Measure",
+                measure_options,
+                index=option_index(measure_options, default_measure),
+                format_func=axis_title,
+                key="ci_measure",
+            )
+        with control_cols[1]:
+            group_choices: list[str | None] = [None] + group_options
+            group_col = st.selectbox(
+                "Compare by",
+                group_choices,
+                index=option_index(group_choices, default_group),
+                format_func=lambda c: "Nothing (whole dataset)" if c is None else pretty_column_label(c),
+                key="ci_group",
+            )
+        with control_cols[2]:
+            time_choices: list[str | None] = [None] + time_options
+            time_col = st.selectbox(
+                "Time",
+                time_choices,
+                index=option_index(time_choices, time_options[0] if time_options else None),
+                format_func=lambda c: "No time column" if c is None else pretty_column_label(c),
+                key="ci_time",
+            )
+        with control_cols[3]:
+            geo_choices: list[str | None] = [None] + [c for c in group_options if c != group_col]
+            geo_col = st.selectbox(
+                "Place",
+                geo_choices,
+                index=option_index(geo_choices, geo_default),
+                format_func=lambda c: "No place column" if c is None else pretty_column_label(c),
+                key="ci_geo",
+            )
+
+        filter_cols = st.columns([1.2, 1.4, 1.4], gap="medium", vertical_alignment="bottom")
+        focus: str | None = None
+        with filter_cols[0]:
+            if geo_col:
+                places = sorted(df_all[geo_col].dropna().astype(str).str.strip().unique().tolist())
+                focus = st.selectbox(
+                    f"Focus {pretty_column_label(geo_col).lower()}",
+                    places,
+                    index=option_index(places, "Nigeria"),
+                    key="ci_focus",
+                )
+        scoped = df_all
+        with filter_cols[1]:
+            has_iita = bool(group_col) and df_all[group_col].dropna().astype(str).map(iita_crop_group).notna().any()
+            if has_iita:
+                iita_only = st.toggle(
+                    "IITA mandate crops only",
+                    value=True,
+                    help="Cassava, yam, maize, cowpea, soybean, banana and plantain.",
+                    key="ci_iita_only",
+                )
+                if iita_only:
+                    scoped = scoped[scoped[group_col].astype(str).map(iita_crop_group).notna()]
+        with filter_cols[2]:
+            if time_col:
+                years = period_values(df_all[time_col])
+                if years.notna().any() and years.min() < years.max():
+                    lo, hi = int(years.min()), int(years.max())
+                    year_range = st.slider("Years", lo, hi, (lo, hi), key=f"ci_years_{time_col}_{lo}_{hi}")
+                    in_range = period_values(scoped[time_col]).between(*year_range)
+                    scoped = scoped[in_range]
+
+        unit = measure_unit(value_col)
+        label = measure_label(value_col)
+
+        if scoped.empty:
+            st.warning("No rows match these filters.", icon=":material/filter_alt_off:")
+        else:
+            quality_for_summary = cached_quality_report(
+                df_all, tuple(default_quality_keys(df_all)), quality_group_default(df_all)
+            )
+            st.subheader("What the data says")
+            render_insight_cards(
+                cached_summary(scoped, value_col, group_col, time_col, geo_col, focus, quality_for_summary),
+                per_row=2,
+            )
+            st.caption(
+                "Rows for the same place repeat across years, so they are not independent. Treat intervals "
+                "and p-values here as a first look, not as a formal test."
+            )
+
+            tab_names = ["Compare groups", "Trends", "Place vs peers"]
+            compare_tab, trend_tab, peer_tab = st.tabs(tab_names)
+
+            with compare_tab:
+                if not group_col:
+                    st.info("Choose a column under **Compare by** to compare groups.")
+                else:
+                    compare_scope = scoped
+                    if focus:
+                        scope_choice = st.segmented_control(
+                            "Rows",
+                            ["All places", f"{focus} only"],
+                            default="All places",
+                            key="ci_compare_scope",
+                        )
+                        if scope_choice == f"{focus} only":
+                            compare_scope = scoped[scoped[geo_col].astype(str).str.strip() == focus]
+                    table = compare_groups(compare_scope, value_col, group_col, min_n=3)
+                    if table.empty:
+                        st.info("Not enough rows per group (at least 3) to compare.")
+                    else:
+                        shown = table.head(30).copy()
+                        base = alt.Chart(shown).encode(
+                            y=alt.Y("group:N", sort=shown["group"].tolist(), title=None),
+                        )
+                        tooltip = [
+                            alt.Tooltip("group:N", title=pretty_column_label(group_col)),
+                            alt.Tooltip("mean:Q", title="Mean", format=",.0f"),
+                            alt.Tooltip("ci_low:Q", title="95% CI low", format=",.0f"),
+                            alt.Tooltip("ci_high:Q", title="95% CI high", format=",.0f"),
+                            alt.Tooltip("median:Q", title="Median", format=",.0f"),
+                            alt.Tooltip("n:Q", title="Rows", format=","),
+                        ]
+                        interval = base.mark_rule(strokeWidth=2, color=SERIES_PALETTE[0]).encode(
+                            x=alt.X("ci_low:Q", title=f"Mean {axis_title(value_col).lower()} with 95% CI"),
+                            x2="ci_high:Q",
+                            tooltip=tooltip,
+                        )
+                        dots = base.mark_circle(size=90, opacity=1, color=SERIES_PALETTE[0]).encode(
+                            x="mean:Q", tooltip=tooltip
+                        )
+                        chart = (
+                            (interval + dots)
+                            .properties(height=max(160, 26 * len(shown)))
+                            .configure_view(stroke=None)
+                            .configure_axisY(labelOverlap=False)
+                            .configure_axis(gridOpacity=0.18, labelColor=AXIS_INK, titleColor=AXIS_INK, labelLimit=260)
+                        )
+                        st.altair_chart(chart, width="stretch")
+                        test = group_difference_test(compare_scope, value_col, group_col)
+                        if test is not None:
+                            verdict = "clearly differ" if test["p_value"] < 0.05 else "do not clearly differ"
+                            st.caption(
+                                f"Kruskal-Wallis test across {test['n_groups']} groups ({test['n_rows']:,} rows): "
+                                f"H = {test['statistic']:,.1f}, p {format_p(test['p_value'])}. The groups {verdict}."
+                            )
+                        st.dataframe(
+                            table,
+                            hide_index=True,
+                            width="stretch",
+                            column_config={
+                                "group": st.column_config.TextColumn(pretty_column_label(group_col)),
+                                "n": st.column_config.NumberColumn("Rows", format="%d"),
+                                "mean": st.column_config.NumberColumn(f"Mean ({unit})" if unit else "Mean", format="%.1f"),
+                                "median": st.column_config.NumberColumn("Median", format="%.1f"),
+                                "std": st.column_config.NumberColumn("Std dev", format="%.1f"),
+                                "ci_low": st.column_config.NumberColumn("95% CI low", format="%.1f"),
+                                "ci_high": st.column_config.NumberColumn("95% CI high", format="%.1f"),
+                            },
+                        )
+
+            with trend_tab:
+                if not time_col:
+                    st.info("Choose a **Time** column to see trends.")
+                else:
+                    trend_scope = scoped
+                    if focus:
+                        trend_place = st.segmented_control(
+                            "Rows",
+                            [f"{focus} only", "All places"],
+                            default=f"{focus} only",
+                            key="ci_trend_scope",
+                        )
+                        if trend_place != "All places":
+                            trend_scope = scoped[scoped[geo_col].astype(str).str.strip() == focus]
+                    means = period_means(trend_scope, value_col, time_col, group_col)
+                    if means.empty:
+                        st.info("No values to plot for this selection.")
+                    else:
+                        available = (
+                            means.groupby("group")["n"].sum().sort_values(ascending=False).index.tolist()
+                        )
+                        picked = st.multiselect(
+                            f"{pretty_column_label(group_col)} to plot" if group_col else "Series",
+                            available,
+                            default=available[: min(ANALYSIS_MAX_SERIES, len(available))],
+                            max_selections=ANALYSIS_MAX_SERIES,
+                            key=f"ci_trend_groups_{abs(hash(tuple(available)))}",
+                        )
+                        indexed = st.toggle(
+                            "Index to first year = 100",
+                            value=len(picked) > 1,
+                            help="Puts groups with very different levels on one scale, so their growth can be compared.",
+                            key="ci_trend_index",
+                        )
+                        plot_df = means[means["group"].isin(picked)].copy()
+                        if plot_df.empty:
+                            st.info("Pick at least one series.")
+                        else:
+                            if indexed:
+                                first = plot_df.sort_values("period").groupby("group")["value"].transform("first")
+                                plot_df["plot_value"] = plot_df["value"] / first.replace(0, np.nan) * 100
+                                y_title = f"{label} index (first year = 100)"
+                            else:
+                                plot_df["plot_value"] = plot_df["value"]
+                                y_title = f"Mean {axis_title(value_col).lower()}"
+                            color = alt.Color(
+                                "group:N",
+                                scale=alt.Scale(domain=picked, range=SERIES_PALETTE[: len(picked)]),
+                                legend=alt.Legend(title=None, orient="top", labelColor=AXIS_INK, labelLimit=240),
+                            )
+                            hover = alt.selection_point(fields=["period"], nearest=True, on="pointerover", empty=False)
+                            base = alt.Chart(plot_df).encode(
+                                x=alt.X("period:Q", title=None, axis=alt.Axis(format="d", labelColor=AXIS_INK)),
+                                y=alt.Y("plot_value:Q", title=y_title, axis=alt.Axis(labelColor=AXIS_INK, titleColor=AXIS_INK)),
+                                color=color,
+                            )
+                            lines = base.mark_line(strokeWidth=2, interpolate="monotone")
+                            points = base.mark_circle(size=64).encode(
+                                opacity=alt.when(hover).then(alt.value(1)).otherwise(alt.value(0)),
+                                tooltip=[
+                                    alt.Tooltip("group:N", title=pretty_column_label(group_col) if group_col else "Series"),
+                                    alt.Tooltip("period:Q", title="Year", format="d"),
+                                    alt.Tooltip("value:Q", title=f"Mean ({unit})" if unit else "Mean", format=",.0f"),
+                                    alt.Tooltip("n:Q", title="Rows"),
+                                ],
+                            ).add_params(hover)
+                            rule = (
+                                alt.Chart(plot_df)
+                                .mark_rule(color=AXIS_INK, strokeWidth=1, opacity=0.6)
+                                .encode(x="period:Q")
+                                .transform_filter(hover)
+                            )
+                            layers = [lines, points, rule]
+                            if len(picked) <= 4:
+                                last_points = plot_df.sort_values("period").groupby("group").tail(1)
+                                layers.append(
+                                    alt.Chart(last_points)
+                                    .mark_text(align="left", dx=6, fontSize=11, color=THEME["text"])
+                                    .encode(x="period:Q", y="plot_value:Q", text="group:N")
+                                )
+                            chart = (
+                                alt.layer(*layers)
+                                .properties(height=380)
+                                .configure_view(stroke=None)
+                                .configure_axis(gridOpacity=0.18)
+                            )
+                            st.altair_chart(chart, width="stretch")
+
+                            trends = trend_by_group(
+                                trend_scope[trend_scope[group_col].astype(str).str.strip().isin(picked)]
+                                if group_col
+                                else trend_scope,
+                                value_col,
+                                time_col,
+                                group_col,
+                            )
+                            if not trends.empty:
+                                trends["clear"] = np.where(trends["p_value"] < 0.05, "Yes", "No")
+                                st.dataframe(
+                                    trends[
+                                        ["group", "first_period", "last_period", "fitted_start", "fitted_end",
+                                         "pct_per_period", "r2", "p_value", "clear"]
+                                    ],
+                                    hide_index=True,
+                                    width="stretch",
+                                    column_config={
+                                        "group": st.column_config.TextColumn(
+                                            pretty_column_label(group_col) if group_col else "Series"
+                                        ),
+                                        "first_period": st.column_config.NumberColumn("From", format="%d"),
+                                        "last_period": st.column_config.NumberColumn("To", format="%d"),
+                                        "fitted_start": st.column_config.NumberColumn("Trend start", format="%.0f"),
+                                        "fitted_end": st.column_config.NumberColumn("Trend end", format="%.0f"),
+                                        "pct_per_period": st.column_config.NumberColumn("Change per year", format="%+.1f%%"),
+                                        "r2": st.column_config.NumberColumn("R²", format="%.2f"),
+                                        "p_value": st.column_config.NumberColumn("p-value", format="%.4f"),
+                                        "clear": st.column_config.TextColumn("Clear trend (p < 0.05)"),
+                                    },
+                                )
+                                st.caption(
+                                    "Trend = straight line through the yearly means. Change per year is the slope as "
+                                    "a share of the series' average level."
+                                )
+
+            with peer_tab:
+                if not (geo_col and group_col and focus):
+                    st.info("Choose both a **Compare by** column and a **Place** column to benchmark one place.")
+                else:
+                    window = (
+                        st.slider("Recent years to average", 1, 10, 5, key="ci_peer_window") if time_col else None
+                    )
+                    bench = benchmark_against_peers(
+                        scoped, value_col, group_col, geo_col, focus, time_col, recent_periods=window or 5
+                    )
+                    if bench.empty:
+                        st.info(
+                            f"{focus} has no groups with at least three other places to compare against "
+                            "under the current filters."
+                        )
+                    else:
+                        bench = bench.copy()
+                        bench["position"] = np.where(bench["gap_pct"] >= 0, "Above peer median", "Below peer median")
+                        bars = (
+                            alt.Chart(bench)
+                            .mark_bar(cornerRadiusEnd=4, height={"band": 0.7})
+                            .encode(
+                                y=alt.Y("group:N", sort=bench["group"].tolist(), title=None),
+                                x=alt.X("gap_pct:Q", title=f"{focus} vs peer median (%)"),
+                                color=alt.Color(
+                                    "position:N",
+                                    scale=alt.Scale(
+                                        domain=["Above peer median", "Below peer median"],
+                                        range=[SERIES_PALETTE[0], SERIES_PALETTE[1]],
+                                    ),
+                                    legend=alt.Legend(title=None, orient="top", labelColor=AXIS_INK),
+                                ),
+                                tooltip=[
+                                    alt.Tooltip("group:N", title=pretty_column_label(group_col)),
+                                    alt.Tooltip("focus_value:Q", title=focus, format=",.0f"),
+                                    alt.Tooltip("peer_median:Q", title="Peer median", format=",.0f"),
+                                    alt.Tooltip("gap_pct:Q", title="Gap (%)", format="+.0f"),
+                                    alt.Tooltip("rank:Q", title="Rank"),
+                                    alt.Tooltip("n_places:Q", title="Places compared"),
+                                ],
+                            )
+                        )
+                        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color=AXIS_INK).encode(x="x:Q")
+                        chart = (
+                            (bars + zero)
+                            .properties(height=max(140, 30 * len(bench)))
+                            .configure_view(stroke=None)
+                            .configure_axisY(labelOverlap=False)
+                            .configure_axis(gridOpacity=0.18, labelColor=AXIS_INK, titleColor=AXIS_INK, labelLimit=260)
+                        )
+                        st.altair_chart(chart, width="stretch")
+                        st.dataframe(
+                            bench[["group", "focus_value", "peer_median", "gap_pct", "rank", "n_places", "window"]],
+                            hide_index=True,
+                            width="stretch",
+                            column_config={
+                                "group": st.column_config.TextColumn(pretty_column_label(group_col)),
+                                "focus_value": st.column_config.NumberColumn(
+                                    f"{focus} ({unit})" if unit else focus, format="%.0f"
+                                ),
+                                "peer_median": st.column_config.NumberColumn("Peer median", format="%.0f"),
+                                "gap_pct": st.column_config.NumberColumn("Gap", format="%+.0f%%"),
+                                "rank": st.column_config.NumberColumn("Rank (1 = highest)", format="%d"),
+                                "n_places": st.column_config.NumberColumn("Places compared", format="%d"),
+                                "window": st.column_config.TextColumn("Years averaged"),
+                            },
+                        )
+                        st.caption(
+                            "Each place is reduced to its own mean over the window, so places with more rows do "
+                            "not count more. The peer figure is the median of the other places' means."
+                        )
+
+
+# -----------------------------------------------------------------------------
+# Page: Data Quality
+# -----------------------------------------------------------------------------
+def page_data_quality() -> None:
+    quality_upload = session_upload()
+    render_page_header(
+        "Data quality",
+        "The checks to run before trusting a dataset: blanks, duplicates, impossible values, "
+        "numbers stored as text, inconsistent labels and extreme values.",
+        chips=[
+            ("Source", "Your upload" if quality_upload else "Demo panel"),
+            ("Rows", format_num(len(active_df), 0) if active_df is not None else "0"),
+            ("Columns", format_num(active_df.shape[1], 0) if active_df is not None else "0"),
+        ],
+        eyebrow="Data validation",
+    )
+    st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
+    if quality_upload is not None:
+        st.info(upload_privacy_note(quality_upload), icon=":material/lock:")
+
+    if active_df is None or active_df.empty:
+        st.info("Load a dataset to check it. Use the Uploads page to add a CSV.", icon=":material/database:")
+    else:
+        dq_df = active_df
+        dq_columns = [str(c) for c in dq_df.columns]
+        dq_groups = category_columns(dq_df)
+        setting_cols = st.columns(2, gap="medium")
+        with setting_cols[0]:
+            key_cols = st.multiselect(
+                "Columns that should identify each record",
+                dq_columns,
+                default=default_quality_keys(dq_df),
+                help="Used to find repeated records, e.g. the same farmer and season entered twice.",
+                key="dq_keys",
+            )
+        with setting_cols[1]:
+            dq_group_choices: list[str | None] = [None] + dq_groups
+            dq_group = st.selectbox(
+                "Judge extreme values within each",
+                dq_group_choices,
+                index=option_index(dq_group_choices, quality_group_default(dq_df)),
+                format_func=lambda c: "Whole dataset" if c is None else pretty_column_label(c),
+                help="A cassava yield is only extreme compared with other cassava yields.",
+                key="dq_group",
+            )
+
+        report = cached_quality_report(dq_df, tuple(key_cols), dq_group)
+        issues_df = pd.DataFrame(report["issues"])
+        counts = {sev: sum(1 for i in report["issues"] if i["severity"] == sev) for sev in SEVERITY_LABELS}
+
+        kpi_cols = st.columns(4, gap="small")
+        with kpi_cols[0]:
+            kpi_card(
+                "Quality score",
+                f"{report['score']}/100",
+                "Starts at 100; each finding deducts by severity",
+                color="#0ca30c" if counts["high"] == 0 else "#d03b3b",
+            )
+        with kpi_cols[1]:
+            kpi_card("High severity", str(counts["high"]), "Fix before analysis", color="#d03b3b")
+        with kpi_cols[2]:
+            kpi_card("Medium severity", str(counts["medium"]), "Review and document", color="#fab219")
+        with kpi_cols[3]:
+            kpi_card("Low severity", str(counts["low"]), "Worth knowing", color=AXIS_INK)
+
+        st.subheader("Findings")
+        if issues_df.empty:
+            st.success("No issues found by these checks.", icon=":material/check_circle:")
+        else:
+            issues_view = issues_df.assign(severity=issues_df["severity"].map(SEVERITY_LABELS))
+            st.dataframe(
+                issues_view,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "severity": st.column_config.TextColumn("Severity", width="small"),
+                    "check": st.column_config.TextColumn("Check"),
+                    "column": st.column_config.TextColumn("Column"),
+                    "rows_affected": st.column_config.NumberColumn("Rows affected", format="%d"),
+                    "detail": st.column_config.TextColumn("What it means", width="large"),
+                    "examples": st.column_config.TextColumn("Examples", width="medium"),
+                },
+            )
+            st.download_button(
+                "Download findings (CSV)",
+                issues_view.to_csv(index=False).encode("utf-8"),
+                file_name="data_quality_findings.csv",
+                mime="text/csv",
+                icon=":material/download:",
+            )
+
+        profile = report["profile"]
+        st.subheader("Column profile")
+        missing = profile[profile["missing_pct"] > 0].sort_values("missing_pct", ascending=False).head(15)
+        if not missing.empty:
+            missing_chart = (
+                alt.Chart(missing)
+                .mark_bar(cornerRadiusEnd=4, color=SERIES_PALETTE[0], height={"band": 0.7})
+                .encode(
+                    y=alt.Y("column:N", sort="-x", title=None),
+                    x=alt.X("missing_pct:Q", title="Missing values (%)", scale=alt.Scale(domain=[0, 100])),
+                    tooltip=[
+                        alt.Tooltip("column:N", title="Column"),
+                        alt.Tooltip("missing_pct:Q", title="Missing (%)", format=".1f"),
+                    ],
+                )
+                .properties(height=max(120, 26 * len(missing)))
+                .configure_view(stroke=None)
+                .configure_axisY(labelOverlap=False)
+                .configure_axis(gridOpacity=0.18, labelColor=AXIS_INK, titleColor=AXIS_INK, labelLimit=260)
+            )
+            st.altair_chart(missing_chart, width="stretch")
+        st.dataframe(
+            profile,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "column": st.column_config.TextColumn("Column"),
+                "type": st.column_config.TextColumn("Read as"),
+                "missing_pct": st.column_config.ProgressColumn("Missing", format="%.1f%%", min_value=0, max_value=100),
+                "unique": st.column_config.NumberColumn("Distinct values", format="%d"),
+                "example": st.column_config.TextColumn("Example"),
+            },
+        )
+
+        with st.expander("What each check looks for", icon=":material/help:"):
+            render_markdown_block(
+                """
+                - **Empty / many missing values**: blank cells. Decide whether a blank means zero, not collected, or not applicable before filling it in.
+                - **Duplicate rows / repeated records**: rows counted twice inflate totals and shrink error bars.
+                - **Impossible negative values**: yields, areas, prices, ages and similar quantities cannot be below zero.
+                - **Percentage above 100** and **implausible year**: values outside the range the column allows.
+                - **Numbers stored as text**: a column that is mostly numbers but has entries like `n/a` or `2,4`; it cannot be averaged until fixed.
+                - **Inconsistent labels / extra spaces**: `Maize`, `maize ` and `MAIZE` would be counted as three crops.
+                - **Extreme values**: more than 5 robust standard deviations (median absolute deviation) from the typical value within each group, on a log scale for skewed quantities. They may be real; check them for unit or entry errors.
+                """
+            )
 
 
 # -----------------------------------------------------------------------------
 # Page: Overview
 # -----------------------------------------------------------------------------
-elif page == "Overview":
-    render_page_header("Overview")
-    st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
-    
-    st.markdown("## What is AgroSynapse?")
-    render_markdown_block(
-        """
-        AgroSynapse is an intelligent platform that transforms agricultural survey data into actionable insights for farmers, researchers, and policymakers.
-
-        **Key Capabilities:**
-        - **Survey Data Ingestion**: Automatically process and clean raw survey data from KoboToolbox and other sources
-        - **Predictive Modeling**: Train machine learning models to forecast crop yields and optimize farming practices
-        - **Analytics Dashboard**: Visualize trends, adoption rates, and regional performance metrics
-        - **Decision Support**: Provide data-driven recommendations for agricultural interventions
-        """
+def page_overview() -> None:
+    render_page_header(
+        "About AgroSynapse",
+        "An analyst's workflow for agricultural data: check it, clean it, describe it and, "
+        "where the data supports it, forecast from it.",
+        eyebrow="Project",
     )
-    
-    st.markdown("## How It Works")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### Data Flow")
+    st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
+
+    st.subheader("What it does")
+    feature_cols = st.columns(2, gap="medium")
+    features = [
+        (DATA_QUALITY_PAGE, "Data quality", "Flags blanks, duplicates, impossible values, numbers stored as text, "
+         "inconsistent labels and extreme values in any CSV."),
+        (CROP_INSIGHTS_PAGE, "Crop insights", "Compares crops and places with confidence intervals, fits trends, benchmarks "
+         "one place against its peers, and writes the findings in plain language."),
+        (MODEL_PAGE, "Yield forecasting", "Forecasts next season's yield per country and crop, scored on years the model never saw "
+         "and against a naive carry-forward forecast."),
+        (UPLOADS_PAGE, "Cleaning pipeline", "Normalises column names, drops KoboToolbox metadata, and keeps identifiers and "
+         "target-derived columns out of the model."),
+    ]
+    for index, (target_page, label, description) in enumerate(features):
+        with feature_cols[index % 2], st.container(border=True, height="stretch"):
+            st.page_link(target_page, label=f"**{label}**")
+            st.caption(description)
+
+    flow_col, data_col = st.columns(2, gap="medium")
+    with flow_col:
+        st.subheader("How it works")
         render_markdown_block(
             """
-            1. **Ingest** raw survey data
-            2. **Clean** and transform data
-            3. **Train** predictive models
-            4. **Analyze** and visualize results
+            1. **Load** a CSV: the demo panel, or your own upload
+            2. **Check** its quality and fix what the checks find
+            3. **Describe** it with group comparisons, trends and peer benchmarks
+            4. **Model** it: train, evaluate against a naive benchmark, predict
             """
         )
-    with col2:
-        st.markdown("### Value Proposition")
+    with data_col:
+        st.subheader("The demo data")
         render_markdown_block(
             """
-            - Reduce manual data processing time by 80%
-            - Improve prediction accuracy with ML models
-            - Enable evidence-based decision making
-            - Scale agricultural monitoring efforts
+            - 25,305 rows, one per **country, crop and year**: 54 African countries, 23 crops, 1990-2024
+            - Built from public **FAOSTAT** and **World Bank** data (CC BY 4.0)
+            - National figures, not farm records, so results describe countries rather than farms
+            - On 2018-2024, the forecast's average error is about a third lower than "same as last season"
             """
         )
+
 
 # -----------------------------------------------------------------------------
 # Page: Settings
 # -----------------------------------------------------------------------------
-elif page == "Settings":
+def page_settings() -> None:
     settings = app_settings()
+    demo = is_demo_mode()
     settings_score, settings_readiness_label, settings_recommendations = settings_readiness_summary(settings)
-    settings_header_chips = [
-        ("Readiness", settings_readiness_label),
-        ("Animations", "On" if bool(settings["enable_animations"]) else "Off"),
-        ("Data diff", "On" if bool(settings["show_data_diff"]) else "Off"),
-        ("Histogram bins", str(int(settings["dashboard_hist_bins"]))),
-    ]
     render_page_header(
-        "Settings & Configuration",
-        "Control paths, dashboard behavior, and quality-of-life options without changing the app's underlying pipeline logic.",
-        chips=settings_header_chips,
+        "Settings",
+        "File paths and dashboard behaviour. Changes are saved for everyone using this server, "
+        "so they are locked on the shared demo.",
+        chips=[
+            ("Readiness", settings_readiness_label),
+            ("Animations", "On" if bool(settings["enable_animations"]) else "Off"),
+            ("Data diff", "On" if bool(settings["show_data_diff"]) else "Off"),
+            ("Write access", "Locked" if demo else "Enabled"),
+        ],
         eyebrow="App controls",
     )
     st.markdown('<div class="view-gap"></div>', unsafe_allow_html=True)
+
+    if demo:
+        st.info(DEMO_NOTICE, icon=":material/visibility:")
 
     settings_health_rows = settings_path_health_rows(settings)
     ready_paths = sum(1 for row in settings_health_rows if row["Status"] == "Ready")
     attention_paths = len(settings_health_rows) - ready_paths
 
-    smart_cols = st.columns(3, gap="medium")
+    smart_cols = st.columns(3, gap="small")
     with smart_cols[0]:
         kpi_card(
-            "Settings Readiness",
+            "Setup readiness",
             f"{settings_score}/100",
             settings_readiness_label,
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2 3 7v6c0 5 3.8 9.74 9 11 5.2-1.26 9-6 9-11V7zm0 2.18 7 3.11V13c0 4.07-2.83 7.92-7 9.06C7.83 20.92 5 17.07 5 13V7.29z"/></svg>',
+            KPI_ICONS["shield"],
             "#52d273" if settings_score >= 85 else "#f7b267",
         )
     with smart_cols[1]:
         kpi_card(
-            "Ready Paths",
+            "Files ready",
             f"{ready_paths}/{len(settings_health_rows)}",
-            "Existing and readable",
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M10 17 5 12l1.41-1.41L10 14.17l7.59-7.59L19 8z"/></svg>',
+            "Present and readable",
+            KPI_ICONS["check"],
             "#34c2a6",
         )
     with smart_cols[2]:
         kpi_card(
-            "Needs Attention",
+            "Needs attention",
             format_num(attention_paths, 0),
             "Missing or unreadable",
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M1 21h22L12 2zm12-3h-2v-2h2zm0-4h-2v-4h2z"/></svg>',
+            KPI_ICONS["alert"],
             "#f39a58" if attention_paths else "#52d273",
         )
 
-    st.markdown('<div class="upload-preview-card-gap"></div>', unsafe_allow_html=True)
-    settings_rec_col, settings_table_col = st.columns([0.85, 1.45], gap="large")
-    with settings_rec_col:
-        with st.container(border=True):
-            st.markdown("#### Smart Recommendations")
-            for recommendation in settings_recommendations:
-                st.write(f"- {recommendation}")
+    rec_col, table_col = st.columns([0.85, 1.45], gap="medium")
+    with rec_col, st.container(border=True, height="stretch"):
+        st.markdown("**Recommendations**")
+        st.markdown("\n".join(f"- {item}" for item in settings_recommendations))
 
-            raw_primary_exists = Path(str(settings["raw_data_path"])).expanduser().exists()
-            raw_fallback_exists = Path(str(settings["raw_fallback_path"])).expanduser().exists()
-            if not raw_primary_exists and raw_fallback_exists:
-                if st.button("Use Fallback CSV As Primary", width="stretch"):
-                    updated_settings = settings.copy()
-                    updated_settings["raw_data_path"] = str(settings["raw_fallback_path"])
-                    st.session_state["app_settings"] = updated_settings
-                    save_app_settings(updated_settings)
-                    st.success("Primary raw path updated.")
-                    st.rerun()
+        raw_primary_exists = Path(str(settings["raw_data_path"])).expanduser().exists()
+        raw_fallback_exists = Path(str(settings["raw_fallback_path"])).expanduser().exists()
+        if not raw_primary_exists and raw_fallback_exists:
+            if st.button(
+                "Use fallback CSV as primary", width="stretch", disabled=demo
+            ) and guard_write_action("Changing the raw data path"):
+                updated_settings = settings.copy()
+                updated_settings["raw_data_path"] = str(settings["raw_fallback_path"])
+                st.session_state["app_settings"] = updated_settings
+                save_app_settings(updated_settings)
+                flash("Primary raw path updated.")
 
-    with settings_table_col:
-        with st.container(border=True):
-            st.markdown("#### Path Health")
-            st.dataframe(pd.DataFrame(settings_health_rows), width="stretch", hide_index=True)
+    with table_col, st.container(border=True, height="stretch"):
+        st.markdown("**File health**")
+        st.dataframe(
+            pd.DataFrame(settings_health_rows),
+            width="stretch",
+            hide_index=True,
+            column_config={"Details": st.column_config.TextColumn(width="medium")},
+        )
 
-    st.markdown('<div class="stack-gap"></div>', unsafe_allow_html=True)
-    st.markdown("### App Settings")
-    st.caption("These settings are saved to `data/processed/app_settings.json` and used on every rerun.")
+    st.subheader("App settings")
+    st.caption("Saved to `data/processed/app_settings.json` and applied on every rerun.")
 
     with st.form("app_settings_form", clear_on_submit=False):
-        st.markdown("#### Data Paths")
+        st.markdown("**Data paths**")
         path_col_1, path_col_2 = st.columns(2, gap="large")
         with path_col_1:
-            raw_data_path = st.text_input("Primary Raw Data Path", value=str(settings["raw_data_path"]))
-            raw_fallback_path = st.text_input("Fallback Raw Data Path", value=str(settings["raw_fallback_path"]))
-            clean_data_path = st.text_input("Clean Data Path", value=str(settings["clean_data_path"]))
-            features_data_path = st.text_input("Features Data Path", value=str(settings["features_data_path"]))
+            raw_data_path = st.text_input("Primary raw data", value=str(settings["raw_data_path"]), disabled=demo)
+            raw_fallback_path = st.text_input(
+                "Fallback raw data", value=str(settings["raw_fallback_path"]), disabled=demo
+            )
+            clean_data_path = st.text_input("Cleaned data", value=str(settings["clean_data_path"]), disabled=demo)
+            features_data_path = st.text_input(
+                "Features", value=str(settings["features_data_path"]), disabled=demo
+            )
         with path_col_2:
-            metrics_path = st.text_input("Metrics Path", value=str(settings["metrics_path"]))
-            predictions_path = st.text_input("Predictions Path", value=str(settings["predictions_path"]))
-            model_path = st.text_input("Model Artifact Path", value=str(settings["model_path"]))
+            metrics_path = st.text_input("Model metrics", value=str(settings["metrics_path"]), disabled=demo)
+            predictions_path = st.text_input("Predictions", value=str(settings["predictions_path"]), disabled=demo)
+            model_path = st.text_input("Model artifact", value=str(settings["model_path"]), disabled=demo)
 
-        st.markdown("#### Dashboard Behavior")
-        dashboard_hist_bins = st.slider(
-            "Yield Histogram Bins",
-            min_value=8,
-            max_value=40,
-            value=int(settings["dashboard_hist_bins"]),
-            step=1,
+        st.markdown("**Dashboard behaviour**")
+        slider_col_1, slider_col_2 = st.columns(2, gap="large")
+        with slider_col_1:
+            dashboard_hist_bins = st.slider(
+                "Histogram bins",
+                min_value=8,
+                max_value=40,
+                value=int(settings["dashboard_hist_bins"]),
+                step=1,
+                disabled=demo,
+                help="Used when the data does not suggest a bin count of its own.",
+            )
+        with slider_col_2:
+            top_regions_limit = st.slider(
+                "Groups in the record-count chart",
+                min_value=5,
+                max_value=20,
+                value=int(settings["top_regions_limit"]),
+                step=1,
+                disabled=demo,
+            )
+        enable_animations = st.toggle("Animations", value=bool(settings["enable_animations"]), disabled=demo)
+        show_data_diff = st.toggle(
+            "Show raw-to-clean changes on the dashboard", value=bool(settings["show_data_diff"]), disabled=demo
         )
-        top_regions_limit = st.slider(
-            "Top Regions in Farmer Distribution",
-            min_value=5,
-            max_value=20,
-            value=int(settings["top_regions_limit"]),
-            step=1,
-        )
-        enable_animations = st.toggle("Enable Animations", value=bool(settings["enable_animations"]))
-        show_data_diff = st.toggle("Show Data Diff Section", value=bool(settings["show_data_diff"]))
 
-        submitted = st.form_submit_button("Save Settings")
-        if submitted:
+        submitted = st.form_submit_button("Save settings", type="primary", icon=":material/save:", disabled=demo)
+        if submitted and guard_write_action("Saving settings"):
             updated = {
                 "raw_data_path": raw_data_path.strip(),
                 "raw_fallback_path": raw_fallback_path.strip(),
@@ -4709,40 +4104,70 @@ elif page == "Settings":
             }
             st.session_state["app_settings"] = updated
             save_app_settings(updated)
-            st.success("Settings saved.")
-            st.rerun()
+            flash("Settings saved.")
 
-    rc1, rc2 = st.columns(2, gap="large")
-    with rc1:
-        if st.button("Reset To Defaults", width="stretch"):
+    with st.container(horizontal=True):
+        if st.button(
+            "Reset to defaults", icon=":material/restart_alt:", disabled=demo
+        ) and guard_write_action("Resetting settings"):
             st.session_state["app_settings"] = DEFAULT_SETTINGS.copy()
             save_app_settings(st.session_state["app_settings"])
-            st.success("Settings reset to defaults.")
-            st.rerun()
-    with rc2:
-        if st.button("Reload Settings From Disk", width="stretch"):
+            flash("Settings reset to defaults.")
+        if st.button("Reload from disk", icon=":material/refresh:"):
             st.session_state["app_settings"] = load_app_settings()
             load_csv.clear()
             load_metrics.clear()
-            st.success("Settings reloaded.")
-            st.rerun()
+            flash("Settings reloaded.")
 
-    st.markdown("### Quick Start")
+    st.subheader("Run it locally")
     st.code(
         """
-# 1. Option A (recommended): Upload CSV from Uploads page
+# 1. Install the pinned dependencies (Python 3.11)
+pip install -r requirements.txt
 
-# 1. Option B: Export Kobo data manually
-cp <your-kobo-export>.csv data/raw/kobo_export.csv
+# 2. Build the dataset, train the model and write predictions
+python scripts/run_pipeline.py --input data/raw/africa_crop_yield.csv --target yield_kg_per_ha
 
-# 2. Run full pipeline
-python scripts/run_pipeline.py
-
-# 3. Start dashboard
-streamlit run streamlit_app.py
+# 3. Start the dashboard with write access enabled
+AGROSYNAPSE_MODE=full streamlit run streamlit_app.py
         """.strip(),
         language="bash",
     )
 
 
-st.markdown('<div class="footer">2026 AgroSynapse | Building intelligence for global farming</div>', unsafe_allow_html=True)
+# -----------------------------------------------------------------------------
+# Navigation
+# -----------------------------------------------------------------------------
+# Native multipage routing: every page gets its own URL (/crop-insights, ...), so a
+# view can be linked to directly and the browser's back button works.
+DASHBOARD_PAGE = st.Page(page_dashboard, title="Dashboard", icon=":material/space_dashboard:", default=True)
+UPLOADS_PAGE = st.Page(page_uploads, title="Uploads", icon=":material/upload_file:", url_path="uploads")
+CROP_INSIGHTS_PAGE = st.Page(page_crop_insights, title="Crop insights", icon=":material/grass:", url_path="crop-insights")
+DATA_QUALITY_PAGE = st.Page(page_data_quality, title="Data quality", icon=":material/fact_check:", url_path="data-quality")
+MODEL_PAGE = st.Page(
+    page_model_performance, title="Model performance", icon=":material/model_training:", url_path="model-performance"
+)
+NAV_SECTIONS = {
+    "Analysis": [DASHBOARD_PAGE, CROP_INSIGHTS_PAGE, DATA_QUALITY_PAGE, MODEL_PAGE],
+    "Data": [
+        st.Page(page_data_explorer, title="Data explorer", icon=":material/table_view:", url_path="data-explorer"),
+        UPLOADS_PAGE,
+        st.Page(page_settings, title="Settings", icon=":material/tune:", url_path="settings"),
+    ],
+    "About": [st.Page(page_overview, title="About AgroSynapse", icon=":material/info:", url_path="about")],
+}
+
+if WORDMARK_LOGO_PATH.exists() and SIDEBAR_LOGO_PATH.exists():
+    st.logo(str(WORDMARK_LOGO_PATH), size="large", icon_image=str(SIDEBAR_LOGO_PATH))
+current_page = st.navigation(NAV_SECTIONS)
+st.set_page_config(page_title=f"{current_page.title} · AgroSynapse")
+render_sidebar()
+if flash_message := st.session_state.pop("flash_message", None):
+    st.toast(flash_message, icon=":material/check_circle:")
+current_page.run()
+
+st.markdown(
+    f'<footer class="footer">© {datetime.now().year} AgroSynapse · Demo data from FAOSTAT and the World Bank '
+    "(CC BY 4.0)</footer>",
+    unsafe_allow_html=True,
+)

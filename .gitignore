@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv-*/
 venv/
 env/
 ENV/
@@ -23,6 +24,10 @@ htmlcov/
 
 # Runtime state written by the Streamlit app
 data/processed/app_settings.json
+
+# Pipeline intermediates. kobo_export_raw.csv is a byte-for-byte copy of whichever
+# source CSV was last ingested, so committing it would duplicate the dataset.
+data/raw/kobo_export_raw.csv
 
 # Editors / OS
 .idea/

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -10,7 +11,15 @@ from fastapi import FastAPI, HTTPException
 from joblib import load as joblib_load
 from pydantic import BaseModel, Field
 
-MODEL_PATH = Path("data/processed/model_pipeline.joblib")
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# The saved pipeline pickles custom transformers defined in scripts/transform_utils.py.
+# joblib resolves them by bare module name, so scripts/ must be importable.
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+MODEL_PATH = PROJECT_ROOT / "data" / "processed" / "model_pipeline.joblib"
 
 app = FastAPI(
     title="AgroSynapse Inference API",

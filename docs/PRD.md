@@ -3,55 +3,65 @@
 ## AgroSynapse
 
 ### Overview
-AgroSynapse is an intelligent agricultural survey intelligence platform that transforms any agricultural survey data into predictive insights. It combines mobile-first data collection, automated ETL processing, machine learning models, and interactive dashboards for farm-level decision support.
+AgroSynapse is a data-analysis tool for agricultural datasets. It checks a dataset's quality,
+describes it (group comparisons, trends, peer benchmarks, a written summary) and, where the data
+supports it, trains and evaluates a yield-forecasting model. It ships with a public national
+crop-yield panel for Africa and accepts CSV uploads, including KoboToolbox survey exports.
 
 ### Problem Statement
-Smallholder farmers lack access to data-driven recommendations. Agricultural survey data is often inconsistent and difficult to analyze. AgroSynapse standardizes processing and provides actionable insights through predictive modeling and visualization.
+Agricultural data, whether from field surveys or national statistics, arrives with blanks,
+inconsistent labels, unit slips and duplicates. Analysts spend much of their time finding and
+fixing these before any analysis can be trusted, and summaries are often written by hand. The
+tool shortens that loop: it surfaces problems first, then produces comparisons and findings
+that are reproducible and tied to the numbers.
 
 ### Objectives
-- Support any agricultural survey data format (not just KoboToolbox)
-- Apply consistent data cleaning and feature engineering
-- Train predictive models for agricultural outcomes
-- Provide interactive dashboards for extension agents and cooperatives
-- Enable real-time inference via API
+- Report data-quality problems in any tabular CSV, ranked by severity, with examples
+- Compare groups (crops, regions, varieties) with uncertainty shown, not just averages
+- Show trends over time and benchmark one place against its peers
+- Write findings in plain language, computed from the data rather than generated free-form
+- Train a yield model with leakage-aware features and evaluate it against a naive forecast
+- Serve predictions through an API
 
 ### Target Users
-- Extension agents and agronomists
-- Agricultural cooperatives and NGOs
-- Farm managers and researchers
-- Smallholder farmers (via mobile apps)
+- Data analysts and research assistants working with crop, survey or trial data
+- Agronomists and programme staff who need a quick, defensible read of a dataset
+- Extension and monitoring teams reviewing survey exports before analysis
 
 ### Functional Requirements
-- CSV ingestion with automatic field detection
-- Data cleaning with reproducible rules
-- Feature engineering and categorical encoding
-- Machine learning pipeline for prediction
-- Interactive Streamlit dashboard with charts and filters
-- FastAPI inference endpoint for real-time predictions
-- Support for arbitrary agricultural survey schemas
+- CSV upload with delimiter and encoding detection; uploads stay in the visitor's session
+- Data-quality report: missing values, duplicates, repeated keys, impossible negatives,
+  percentages over 100, implausible years, numbers stored as text, inconsistent labels,
+  extra whitespace, and extreme values judged within groups
+- Crop Insights: group means with 95% confidence intervals and a Kruskal-Wallis test, trend
+  lines with a per-year change, peer benchmarking over a recent window, and a written summary
+- Focus on IITA mandate crops (cassava, yam, maize, cowpea, soybean, banana and plantain)
+- Cleaning pipeline with reproducible rules
+- Machine-learning pipeline with a forward-looking evaluation and a carry-forward benchmark
+- FastAPI inference endpoint
 
 ### Data Processing Rules
 - Normalize column names (lowercase, underscores)
+- Drop KoboToolbox metadata fields
+- Keep identifiers, personal data and target-derived columns out of model features
+- Handle missing data inside the model pipeline (median for numeric, most frequent for categorical)
 - Encode categorical values (one-hot for modeling)
-- Handle missing data (median for numeric, most frequent for categorical)
-- Automatic field type detection and conversion
-- Drop metadata fields (timestamps, UUIDs, etc.)
 
 ### Non-Functional Requirements
-- Python 3.8+
-- Modular, PEP8-compliant code
+- Python 3.11, with pinned dependencies matching the committed model
 - Fast inference (<1 second per prediction)
-- On-premise deployment with no cloud lock-in
-- Responsive web interface
+- Read-only by default when hosted; nothing a visitor uploads is written to disk
+- Tested: analysis functions, feature policy, evaluation and upload isolation
 
 ### Success Metrics
-- Clean dataset generation from any CSV input
-- Predictive model with documented performance metrics
-- User-friendly dashboard with actionable insights
-- API endpoint serving predictions reliably
+- Quality checks catch planted errors in test data and do not flag clean data
+- Every sentence in the written summary can be traced to a computed number
+- The yield model beats the carry-forward benchmark on held-out years
+- All dashboard pages render on both the demo data and an uploaded survey
 
-### Risks
-- Variable data quality across different survey formats
-- Low sample sizes for certain crops/regions
-- Complex survey schemas requiring manual mapping
-- Performance with large datasets
+### Known Limits
+- The demo data is national (country x crop x year); it cannot answer farm-level questions
+- Rows for the same place repeat across years, so intervals and tests are descriptive;
+  repeated-measures models are future work
+- Automatic column detection is a best guess; users can override every choice
+- Extreme-value checks flag values for review; they cannot tell a real value from an error

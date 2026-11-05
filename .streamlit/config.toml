@@ -1,9 +1,42 @@
 [theme]
 base = "dark"
-primaryColor = "#1f6b3b"
+# 4.9:1 against white button text and 3.8:1 against the page, so it clears WCAG AA both
+# as a button fill and as a focus/toggle/slider colour. Keep --brand in
+# assets/theme_static.css in step.
+primaryColor = "#22804a"
 backgroundColor = "#0b121c"
 secondaryBackgroundColor = "#101a24"
 textColor = "#e7ece9"
+linkColor = "#7fcf9f"
+linkUnderline = false
+borderColor = "#22333a"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "12px"
+buttonRadius = "full"
+font = "Poppins:https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap"
+headingFont = "'Space Grotesk':https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap"
+headingFontSizes = ["2rem", "1.45rem", "1.2rem", "1rem", "0.9rem", "0.8rem"]
+headingFontWeights = [700, 700, 600, 600, 600, 600]
+metricValueFontSize = "1.6rem"
+metricValueFontWeight = 600
+dataframeHeaderBackgroundColor = "#151f2a"
+dataframeBorderColor = "#22333a"
+greenColor = "#52d273"
+orangeColor = "#f7b267"
+redColor = "#f2705f"
+# Same slots as SERIES_PALETTE_DARK in streamlit_app.py, so native charts match the
+# Altair ones.
+chartCategoricalColors = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#9085e9"]
+
+[theme.sidebar]
+backgroundColor = "#0f1720"
+secondaryBackgroundColor = "#151f2a"
 
 [client]
 toolbarMode = "minimal"
+
+[server]
+# Uploads are held in memory per visitor. Keep them small enough that several concurrent
+# sessions fit in a free-tier container (about 1 GB of RAM).
+maxUploadSize = 25
